@@ -1,0 +1,251 @@
+# ═══════════════════════════════════════════════════════════════
+# Easy Proxies 配置文件示例
+# ═══════════════════════════════════════════════════════════════
+
+# 运行模式
+# 可选值：
+#   - pool:      节点池模式，所有节点共享一个入口，自动故障转移和负载均衡
+#   - multi-port: 多端口模式，每个节点独立端口，精确控制
+#   - hybrid:     混合模式，同时启用节点池和多端口，节点状态共享
+mode: pool
+
+# 日志级别
+# 可选值：debug, info, warn, error
+log_level: info
+
+# sing-box 核心日志级别（可选）
+# 可选值：trace, debug, info, warn, error, fatal, panic
+# 默认值：warn（减少 sing-box 核心的日志输出）
+# 如果需要调试 sing-box 核心问题，可以设置为 debug 或 trace
+singbox_log_level: warn
+
+# 外部 IP 地址（可选）
+# 用于导出代理池时替换 0.0.0.0
+# Docker 部署时建议配置为服务器公网 IP
+external_ip: ""
+
+# 全局跳过 SSL 证书验证（默认 false）
+# 如果某些节点的证书有问题，可以设置为 true 跳过验证
+skip_cert_verify: false
+
+# ═══════════════════════════════════════════════════════════════
+# 订阅链接配置（可选）
+# ═══════════════════════════════════════════════════════════════
+subscriptions:
+  # 支持多个订阅链接
+  # 格式：订阅名字:订阅链接（订阅名字可选，不填则不添加后缀）
+  # - "订阅名字1:https://example.com/subscribe/v2ray"    # V2Ray 标准订阅（Base64）
+  # - "订阅名字2:https://example.com/subscribe/clash"    # Clash YAML 订阅
+  # - "订阅名字3:https://example.com/subscribe/txt"     # 纯文本订阅（每行一个 URI）
+  # - "https://example.com/subscribe/v2ray"              # 不带订阅名字的订阅链接
+
+# ═══════════════════════════════════════════════════════════════
+# 订阅定时刷新配置（可选）
+# ⚠️ 警告：刷新会重启 sing-box 内核，中断所有连接！
+# ═══════════════════════════════════════════════════════════════
+subscription_refresh:
+  enabled: false           # 是否启用定时刷新（默认 false）
+  interval: 1h            # 刷新间隔（默认 1 小时）
+  timeout: 30s            # 获取订阅超时时间
+  health_check_timeout: 60s   # 新节点健康检查超时时间
+  drain_timeout: 30s       # 旧实例排空超时时间
+  min_available_nodes: 1    # 最少可用节点数，低于此值不切换
+
+# ═══════════════════════════════════════════════════════════════
+# Web 管理界面配置
+# ═══════════════════════════════════════════════════════════════
+management:
+  enabled: true                     # 是否启用 Web 管理界面
+  listen: 0.0.0.0:9090           # 监听地址和端口
+  probe_target: www.apple.com:80     # 健康检查探测目标
+  password: ""                      # WebUI 访问密码（为空则无需密码）
+  path_pwd: ""                      # 路径密码（为空则使用默认路径 /，设置后需访问 /路径密码 才能到达管理页面）
+
+# ═══════════════════════════════════════════════════════════════
+# 节点池/混合模式入口配置
+# ═══════════════════════════════════════════════════════════════
+listener:
+  address: 0.0.0.0                 # 监听地址（0.0.0.0 表示监听所有网卡）
+  port: 2323                        # 监听端口
+  username: username                 # 代理认证用户名（可选）
+  password: password                 # 代理认证密码（可选）
+
+# ═══════════════════════════════════════════════════════════════
+# 节点池配置（pool 和 hybrid 模式使用）
+# ═══════════════════════════════════════════════════════════════
+pool:
+  # 节点选择策略
+  # 可选值：
+  #   - sequential: 顺序轮询（默认）
+  #   - random:    随机选择
+  #   - balance:   负载均衡（选择活跃连接数最少的节点）
+  mode: sequential
+
+  # 失败阈值：连续失败多少次后将节点拉黑
+  failure_threshold: 3
+
+  # 拉黑时长：节点被拉黑后多久恢复
+  blacklist_duration: 24h
+
+# ═══════════════════════════════════════════════════════════════
+# 多端口模式配置（multi-port 和 hybrid 模式使用）
+# ═══════════════════════════════════════════════════════════════
+multi_port:
+  address: 0.0.0.0                 # 监听地址
+  base_port: 24000                  # 起始端口（节点依次递增）
+  username: mpuser                  # 代理认证用户名（可选）
+  password: mppass                  # 代理认证密码（可选）
+
+# ═══════════════════════════════════════════════════════════════
+# 虚拟池配置（所有模式可用）
+# 虚拟池允许通过正则表达式筛选节点，创建独立的负载均衡入口
+# ═══════════════════════════════════════════════════════════════
+virtual_pools:
+  # 示例 1: 美国节点池 - 轮询策略
+  # - name: "US_Pool"                # 虚拟池名称（唯一标识）
+  #   regular: ".*美国.*"             # 正则表达式，匹配节点名称
+  #   address: 0.0.0.0               # 监听地址
+  #   port: 3001                     # 监听端口（不能与其他端口冲突）
+  #   username: ususer               # 认证用户名（可选）
+  #   password: uspass               # 认证密码（可选）
+  #   strategy: sequential           # 负载均衡策略：sequential/random/balance
+
+  # 示例 2: 香港节点池 - 随机策略
+  # - name: "HK_Pool"
+  #   regular: ".*香港.*"
+  #   address: 0.0.0.0
+  #   port: 3002
+  #   username: hkuser
+  #   password: hkpass
+  #   strategy: random
+
+  # 示例 3: 低延迟节点池 - 带延迟阈值过滤
+  # - name: "Fast_Pool"
+  #   regular: ".*"                  # 匹配所有节点
+  #   address: 0.0.0.0
+  #   port: 3003
+  #   strategy: balance              # 最少连接数优先
+  #   max_latency_ms: 200            # 只选择延迟低于 200ms 的节点
+
+  # 示例 4: 日本节点池
+  # - name: "JP_Pool"
+  #   regular: ".*(日本|Japan|JP).*"  # 支持复杂正则
+  #   address: 0.0.0.0
+  #   port: 3004
+  #   strategy: sequential
+
+# ═══════════════════════════════════════════════════════════════
+# 节点配置方式（三选一或混合使用）
+# ═══════════════════════════════════════════════════════════════
+
+# 方式 1: 使用 nodes_file（推荐，最简单）
+# 创建一个文本文件，每行一个代理 URI
+# nodes_file: nodes.txt
+
+# 方式 2: 直接在配置文件中配置（传统方式）
+nodes:
+  # ──────────────────────────────────────────────────────────────────
+  # VMess 节点示例
+  # ──────────────────────────────────────────────────────────────────
+  # URL 格式（推荐）
+  - uri: "vmess://uuid@server:443?encryption=auto&security=tls&sni=example.com&type=ws&host=example.com&path=/path#台湾 VMess"
+
+  # Base64 JSON 格式（标准格式）
+  - uri: "vmess://base64_encoded_json_here#香港 VMess"
+
+  # ──────────────────────────────────────────────────────────────────
+  # VLESS 节点示例
+  # ──────────────────────────────────────────────────────────────────
+  # Reality + TCP + XTLS-Vision
+  - uri: "vless://uuid@server:443?encryption=none&security=reality&sni=example.com&fp=chrome&pbk=xxx&sid=xxx&type=tcp&flow=xtls-rprx-vision#美国 VLESS Reality"
+
+  # TLS + WebSocket
+  - uri: "vless://uuid@server:443?encryption=none&security=tls&sni=example.com&type=ws&host=example.com&path=/ws#日本 VLESS"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Hysteria2 节点示例
+  # ──────────────────────────────────────────────────────────────────
+  - uri: "hysteria2://password@server:443?sni=example.com&insecure=0#🇸🇬 新加坡 HY2"
+
+  # 带混淆
+  - uri: "hysteria2://password@server:443?sni=example.com&obfs=salamander&obfs-password=xxx#英国 HY2"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Shadowsocks 节点示例
+  # ──────────────────────────────────────────────────────────────────
+  - uri: "ss://base64_encoded@server:8388#香港 SS"
+
+  # 带加密方式
+  - uri: "ss://method:password@server:8388#台湾 SS"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Trojan 节点示例
+  # ──────────────────────────────────────────────────────────────────
+  - uri: "trojan://password@server:443?sni=example.com#日本 Trojan"
+
+  # WebSocket 传输
+  - uri: "trojan://password@server:443?sni=example.com&type=ws&host=example.com&path=/trojan#美国 Trojan"
+
+  # ──────────────────────────────────────────────────────────────────
+  # 手动指定端口和名称（适用于多端口模式）
+  # ──────────────────────────────────────────────────────────────────
+  - name: tw-custom
+    uri: "vless://uuid@server:443#自定义台湾节点"
+    port: 24001
+
+  - name: hk-custom
+    uri: "ss://password@server:8388"
+    port: 24002
+
+# 方式 3: 混合使用（两种方式的节点会合并）
+# nodes_file: nodes.txt
+# nodes:
+#   - uri: "vless://xxx@server:443#额外节点"
+
+# ═══════════════════════════════════════════════════════════════
+# URI 格式说明
+# ═══════════════════════════════════════════════════════════════
+#
+# VMess:
+#   vmess://uuid@server:port?encryption=auto&security=tls&type=ws&host=example.com&path=/path#名称
+#   参数：
+#     - encryption/auto/scy: 加密方式 (auto, aes-128-gcm, chacha20-poly1305)
+#     - security/tls: TLS 加密 (tls 或空)
+#     - type/net: 传输协议 (tcp, ws, h2, grpc)
+#     - host: WebSocket/gRPC Host
+#     - path: WebSocket/gRPC Path
+#     - sni: TLS SNI
+#
+# VLESS:
+#   vless://uuid@server:port?encryption=none&security=reality&sni=example.com&type=tcp&flow=xtls-rprx-vision#名称
+#   参数：
+#     - encryption: 通常为 none
+#     - security: 安全协议 (none, tls, reality)
+#     - type: 传输协议 (tcp, ws, http, grpc, httpupgrade)
+#     - flow: 流控 (仅 TCP 支持 xtls-rprx-vision)
+#     - fp: 指纹 (chrome, firefox, safari, randomized 等)
+#     - pbk: Reality 公钥
+#     - sid: Reality 短 ID
+#
+# Hysteria2:
+#   hysteria2://password@server:port?sni=example.com&obfs=salamander&obfs-password=xxx#名称
+#   参数：
+#     - upMbps/downMbps: 上下行带宽限制
+#     - obfs: 混淆类型 (salamander)
+#     - obfs-password: 混淆密码
+#     - sni: TLS SNI
+#
+# Shadowsocks:
+#   ss://base64_encoded@server:8388#名称
+#   ss://method:password@server:8388#名称
+#   常见加密方式：aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
+#
+# Trojan:
+#   trojan://password@server:443?sni=example.com&type=ws&host=example.com&path=/path#名称
+#   参数：
+#     - type: 传输协议 (tcp, ws, h2, grpc)
+#     - host: WebSocket/gRPC Host
+#     - path: WebSocket/gRPC Path
+#     - sni: TLS SNI
+#
+# ═══════════════════════════════════════════════════════════════

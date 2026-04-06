@@ -1,0 +1,2558 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Easy Proxies - 节点监控</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --sf-pro: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+      --primary: #007aff;
+      --primary-hover: #0051d5;
+      --success: #34c759;
+      --warning: #ff9500;
+      --error: #ff3b30;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --bg-elevated: rgba(255, 255, 255, 0.8);
+      --bg-base: #f5f5f7;
+      --border: rgba(0, 0, 0, 0.06);
+      --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04);
+      --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.08);
+      --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.12);
+    }
+
+    body {
+      font-family: var(--sf-pro);
+      background: var(--bg-base);
+      color: var(--text-primary);
+      line-height: 1.47059;
+      font-size: 17px;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .app {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 40px 20px;
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 60px;
+    }
+
+    .header h1 {
+      font-size: 48px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--text-primary);
+      margin-bottom: 12px;
+    }
+
+    .header p {
+      font-size: 21px;
+      color: var(--text-secondary);
+      font-weight: 400;
+    }
+
+    .header .status-line {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 20px;
+      padding: 8px 16px;
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border-radius: 20px;
+      font-size: 14px;
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.6; transform: scale(0.95); }
+    }
+
+    /* Controls */
+    .controls {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin: 32px 0 48px;
+    }
+
+    .btn {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 980px;
+      font-size: 15px;
+      font-weight: 500;
+      font-family: var(--sf-pro);
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      backdrop-filter: saturate(180%) blur(20px);
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: white;
+      box-shadow: 0 2px 8px rgba(0, 122, 255, 0.3);
+    }
+
+    .btn-primary:hover {
+      background: var(--primary-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 16px rgba(0, 122, 255, 0.4);
+    }
+
+    .btn-secondary {
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.95);
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-md);
+    }
+
+    .btn:active {
+      transform: translateY(0);
+    }
+
+    .btn-sm {
+      padding: 6px 14px;
+      font-size: 13px;
+    }
+
+    /* Stats */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 48px;
+    }
+
+    .stat-card {
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 24px;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .stat-card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-lg);
+    }
+
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+    }
+
+    .stat-value {
+      font-size: 48px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1;
+    }
+
+    .stat-trend {
+      font-size: 12px;
+      color: var(--success);
+      margin-top: 8px;
+      font-weight: 500;
+    }
+
+    /* Nodes Grid - 竖向小卡片布局 */
+    .nodes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+    }
+
+    .node-card {
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 320px;
+    }
+
+    .node-card::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 3px;
+      height: 100%;
+      transition: all 0.3s;
+    }
+
+    .node-card.healthy::before { background: var(--success); }
+    .node-card.warning::before { background: var(--warning); }
+    .node-card.error::before { background: var(--error); }
+    .node-card.blacklisted::before { background: var(--text-primary); }
+
+    .node-card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-lg);
+      border-color: rgba(0, 0, 0, 0.1);
+    }
+
+    .node-header {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .node-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .node-name {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .node-tag {
+      font-size: 11px;
+      color: var(--text-secondary);
+      font-family: "SF Mono", Menlo, Monaco, monospace;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-badge {
+      padding: 6px 14px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      letter-spacing: 0.02em;
+    }
+
+    .status-badge.healthy {
+      background: rgba(52, 199, 89, 0.15);
+      color: #1f9b47;
+    }
+
+    .status-badge.warning {
+      background: rgba(255, 149, 0, 0.15);
+      color: #c27100;
+    }
+
+    .status-badge.error {
+      background: rgba(255, 59, 48, 0.15);
+      color: #d32f2f;
+    }
+
+    .status-badge.blacklisted {
+      background: rgba(29, 29, 31, 0.15);
+      color: var(--text-primary);
+    }
+
+    .status-icon {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    /* Latency Display - 紧凑版 */
+    .latency-display {
+      background: linear-gradient(135deg, rgba(0, 122, 255, 0.08), rgba(0, 122, 255, 0.03));
+      border: 1px solid rgba(0, 122, 255, 0.15);
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s;
+      text-align: center;
+    }
+
+    .latency-display:hover {
+      background: linear-gradient(135deg, rgba(0, 122, 255, 0.12), rgba(0, 122, 255, 0.05));
+      border-color: rgba(0, 122, 255, 0.25);
+    }
+
+    .latency-info {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      width: 100%;
+    }
+
+    .latency-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--primary), #0051d5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .latency-text {
+      width: 100%;
+    }
+
+    .latency-label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+
+    .latency-value {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--primary);
+      line-height: 1;
+    }
+
+    .latency-quality {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      font-weight: 500;
+    }
+
+    /* Metrics - 紧凑版 */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-bottom: 12px;
+      flex: 1;
+    }
+
+    .metric {
+      background: rgba(0, 0, 0, 0.02);
+      border-radius: 8px;
+      padding: 10px;
+      transition: all 0.2s;
+    }
+
+    .metric:hover {
+      background: rgba(0, 0, 0, 0.04);
+    }
+
+    .metric-label {
+      font-size: 10px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+
+    .metric-value {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--text-primary);
+    }
+
+    .metric-value.success { color: var(--success); }
+    .metric-value.error { color: var(--error); }
+    .metric-value.warning { color: var(--warning); }
+
+    /* Footer - 紧凑版 */
+    .node-footer {
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: auto;
+    }
+
+    .time-info {
+      font-size: 10px;
+      color: var(--text-secondary);
+      line-height: 1.4;
+    }
+
+    .node-footer .btn {
+      width: 100%;
+      justify-content: center;
+      padding: 8px 16px;
+      font-size: 13px;
+    }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      padding: 16px 24px;
+      border-radius: 16px;
+      box-shadow: var(--shadow-lg);
+      display: none;
+      align-items: center;
+      gap: 12px;
+      max-width: 420px;
+      z-index: 1000;
+      animation: slideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .toast.show { display: flex; }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(100px);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    .toast.success { border-left: 3px solid var(--success); }
+    .toast.error { border-left: 3px solid var(--error); }
+
+    .toast-message {
+      flex: 1;
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    /* Empty State */
+    .empty {
+      text-align: center;
+      padding: 80px 40px;
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+    }
+
+    .empty h3 {
+      font-size: 21px;
+      color: var(--text-primary);
+      margin: 24px 0 12px;
+      font-weight: 700;
+    }
+
+    .empty p {
+      color: var(--text-secondary);
+      font-size: 15px;
+    }
+
+    /* Login Modal */
+    .login-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.4);
+      backdrop-filter: blur(10px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+      animation: fadeIn 0.3s;
+    }
+
+    .login-overlay.show { display: flex; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .login-modal {
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 48px;
+      box-shadow: var(--shadow-lg);
+      max-width: 420px;
+      width: 90%;
+      animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    @keyframes slideUp {
+      from {
+        transform: translateY(40px);
+        opacity: 0;
+      }
+      to {
+        transform: translateY(0);
+        opacity: 1;
+      }
+    }
+
+    .login-header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    .login-header h2 {
+      font-size: 32px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      margin-bottom: 8px;
+    }
+
+    .login-header p {
+      color: var(--text-secondary);
+      font-size: 15px;
+    }
+
+    .login-form {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .form-label {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .form-input {
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 16px;
+      font-family: var(--sf-pro);
+      background: rgba(255, 255, 255, 0.8);
+      transition: all 0.2s;
+    }
+
+    .form-input:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+    }
+
+    .form-help {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+    }
+
+    .login-error {
+      color: var(--error);
+      font-size: 13px;
+      margin-top: -12px;
+      display: none;
+    }
+
+    .login-error.show { display: block; }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-bottom: 32px;
+    }
+
+    .tab {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 980px;
+      font-size: 15px;
+      font-weight: 500;
+      font-family: var(--sf-pro);
+      cursor: pointer;
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      transition: all 0.2s;
+    }
+
+    .tab:hover {
+      background: rgba(255, 255, 255, 0.95);
+      color: var(--text-primary);
+    }
+
+    .tab.active {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+
+    .tab-content {
+      display: none;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    /* Node Management */
+    .manage-header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    .manage-header h2 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    .manage-desc {
+      color: var(--text-secondary);
+      font-size: 15px;
+    }
+
+    .manage-actions {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .btn-warning {
+      background: var(--warning);
+      color: white;
+      box-shadow: 0 2px 8px rgba(255, 149, 0, 0.3);
+    }
+
+    .btn-warning:hover {
+      background: #e68600;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 16px rgba(255, 149, 0, 0.4);
+    }
+
+    .btn-danger {
+      background: var(--error);
+      color: white;
+    }
+
+    .btn-danger:hover {
+      background: #e62e24;
+    }
+
+    .reload-warning {
+      text-align: center;
+      padding: 12px 20px;
+      background: rgba(255, 149, 0, 0.1);
+      border: 1px solid rgba(255, 149, 0, 0.3);
+      border-radius: 12px;
+      color: var(--warning);
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 32px;
+    }
+
+    .config-nodes-grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .config-node-card {
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 24px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      transition: all 0.3s;
+    }
+
+    .config-node-card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-lg);
+    }
+
+    .config-node-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .config-node-name {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .config-node-uri {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-family: "SF Mono", Menlo, Monaco, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 500px;
+    }
+
+    .config-node-port {
+      font-size: 14px;
+      color: var(--primary);
+      font-weight: 500;
+      margin-top: 4px;
+    }
+
+    .config-node-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .modal-buttons {
+      display: flex;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .modal-buttons .btn {
+      flex: 1;
+    }
+
+    /* Toggle Switch */
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 50px;
+      height: 28px;
+      flex-shrink: 0;
+    }
+
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: 0.3s;
+      border-radius: 28px;
+    }
+
+    .toggle-slider:before {
+      position: absolute;
+      content: "";
+      height: 22px;
+      width: 22px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: 0.3s;
+      border-radius: 50%;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+
+    .toggle-switch input:checked + .toggle-slider {
+      background-color: var(--primary);
+    }
+
+    .toggle-switch input:checked + .toggle-slider:before {
+      transform: translateX(22px);
+    }
+
+    /* Probe Progress */
+    .probe-progress {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      z-index: 1500;
+      display: none;
+      animation: slideDown 0.3s ease;
+    }
+
+    .probe-progress.show { display: block; }
+
+    @keyframes slideDown {
+      from { transform: translateY(-100%); }
+      to { transform: translateY(0); }
+    }
+
+    .probe-progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .probe-progress-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .probe-progress-stats {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .probe-progress-bar {
+      height: 6px;
+      background: rgba(0, 0, 0, 0.1);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .probe-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--primary), var(--success));
+      border-radius: 3px;
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+
+    .probe-progress-detail {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      display: flex;
+      gap: 16px;
+    }
+
+    .probe-progress-detail .success { color: var(--success); }
+    .probe-progress-detail .failed { color: var(--error); }
+
+    /* 筛选和分类样式 */
+    .filter-section {
+      margin-bottom: 32px;
+    }
+
+    .filter-input-wrapper {
+      position: relative;
+      max-width: 600px;
+      margin: 0 auto 24px;
+    }
+
+    .filter-input {
+      width: 100%;
+      padding: 14px 48px 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: 16px;
+      font-family: var(--sf-pro);
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      transition: all 0.2s;
+    }
+
+    .filter-input:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+    }
+
+    .filter-clear {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      cursor: pointer;
+      padding: 4px;
+      display: none;
+      font-size: 20px;
+      line-height: 1;
+    }
+
+    .filter-clear.show {
+      display: block;
+    }
+
+    .country-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin-bottom: 16px;
+    }
+
+    .country-filter-btn {
+      padding: 8px 16px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      color: var(--text-primary);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .country-filter-btn:hover {
+      background: rgba(255, 255, 255, 0.95);
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .country-filter-btn.active {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+
+    .country-filter-btn .count {
+      font-size: 12px;
+      opacity: 0.8;
+    }
+
+    .category-section {
+      margin-bottom: 32px;
+    }
+
+    .category-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 2px solid var(--border);
+    }
+
+    .category-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .category-count {
+      font-size: 14px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    /* 虚拟池样式 */
+    .vpool-card {
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 24px;
+      margin-bottom: 24px;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .vpool-card:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-lg);
+    }
+
+    .vpool-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 20px;
+      gap: 16px;
+    }
+
+    .vpool-info {
+      flex: 1;
+    }
+
+    .vpool-name {
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .vpool-pattern {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-family: "SF Mono", Menlo, Monaco, monospace;
+      background: rgba(0, 0, 0, 0.04);
+      padding: 4px 8px;
+      border-radius: 6px;
+      display: inline-block;
+    }
+
+    .vpool-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .vpool-stat {
+      background: rgba(0, 0, 0, 0.02);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .vpool-stat-label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+
+    .vpool-stat-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .vpool-nodes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 12px;
+    }
+
+    .vpool-node-item {
+      background: rgba(0, 0, 0, 0.02);
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+    }
+
+    .vpool-node-item:hover {
+      background: rgba(0, 0, 0, 0.04);
+    }
+
+    .vpool-node-status {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .vpool-node-status.healthy { background: var(--success); }
+    .vpool-node-status.warning { background: var(--warning); }
+    .vpool-node-status.error { background: var(--error); }
+    .vpool-node-status.blacklisted { background: var(--text-primary); }
+
+    .vpool-node-name {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+
+    .vpool-node-latency {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .app { padding: 24px 16px; }
+      .header h1 { font-size: 36px; }
+      .header p { font-size: 17px; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+      .controls { flex-direction: column; }
+      .btn { width: 100%; justify-content: center; }
+      .login-modal { padding: 32px 24px; }
+      .tabs { flex-direction: column; }
+      .tab { width: 100%; }
+      .manage-actions { flex-direction: column; }
+      .config-node-card { flex-direction: column; align-items: stretch; }
+      .config-node-actions { justify-content: flex-end; }
+      .nodes-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+      .country-filters { gap: 6px; }
+      .country-filter-btn { padding: 6px 12px; font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1>Easy Proxies</h1>
+      <p>节点监控中心</p>
+      <div style="display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 20px;">
+        <div class="status-line" style="margin-top: 0;">
+          <span class="status-dot"></span>
+          <span id="lastUpdate">正在加载...</span>
+        </div>
+        <button class="btn btn-secondary" onclick="showSettingsModal()" style="padding: 0; border-radius: 50%; width: 36px; height: 36px; min-width: 36px; display: flex; align-items: center; justify-content: center;" title="系统设置">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Tab 切换 -->
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('monitor')">📊 节点监控</button>
+      <button class="tab" onclick="switchTab('vpools')">🎯 虚拟池</button>
+      <button class="tab" onclick="switchTab('manage')">⚙️ 节点管理</button>
+    </div>
+
+    <!-- 监控页面 -->
+    <div id="monitorTab" class="tab-content active">
+    <!-- 筛选区域 -->
+    <div class="filter-section">
+      <div class="filter-input-wrapper">
+        <input type="text" id="filterInput" class="filter-input" placeholder="🔍 搜索节点名称..." oninput="handleFilterInput()">
+        <button class="filter-clear" id="filterClear" onclick="clearFilter()">×</button>
+      </div>
+      <div class="country-filters" id="countryFilters"></div>
+    </div>
+
+    <div class="controls">
+      <button class="btn btn-primary" onclick="refresh()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M13.65 2.35A7.958 7.958 0 0 0 8 0C3.58 0 0 3.58 0 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L9 7h7V0l-2.35 2.35z" fill="currentColor"/>
+        </svg>
+        刷新数据
+      </button>
+      <button class="btn btn-primary" id="probeAllBtn" onclick="probeAllNodes()">
+        ⚡ 探测全部
+      </button>
+      <button class="btn btn-secondary" onclick="toggleAutoRefresh()">
+        <span id="autoRefreshText">关闭自动刷新</span>
+      </button>
+      <button class="btn btn-secondary" onclick="exportNodes()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M8 0L8 10M8 10L5 7M8 10L11 7M2 13h12v3H2z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        导出节点
+      </button>
+      <button class="btn btn-secondary" id="refreshSubBtn" onclick="refreshSubscription()" style="display: none;">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M13.65 2.35A7.958 7.958 0 0 0 8 0C3.58 0 0 3.58 0 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L9 7h7V0l-2.35 2.35z" fill="currentColor"/>
+        </svg>
+        <span id="refreshSubText">刷新订阅</span>
+      </button>
+    </div>
+
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-label">总节点</div>
+        <div class="stat-value" id="totalNodes">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">健康节点</div>
+        <div class="stat-value" style="color: var(--success);" id="healthyNodes">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">活跃连接</div>
+        <div class="stat-value" style="color: var(--primary);" id="activeConnections">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">拉黑节点</div>
+        <div class="stat-value" style="color: var(--error);" id="blacklistedNodes">0</div>
+      </div>
+      <div class="stat-card" id="subscriptionCard" style="display: none;">
+        <div class="stat-label">订阅状态</div>
+        <div class="stat-value" style="font-size: 24px;" id="subscriptionStatus">-</div>
+        <div class="stat-trend" id="subscriptionTrend">未启用</div>
+      </div>
+    </div>
+
+    <div id="nodesContainer" class="nodes-grid"></div>
+
+    <div id="emptyState" class="empty" style="display: none;">
+      <svg width="64" height="64" viewBox="0 0 64 64" fill="none" opacity="0.2">
+        <circle cx="32" cy="32" r="30" stroke="currentColor" stroke-width="4"/>
+        <path d="M32 16v32M16 32h32" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+      </svg>
+      <h3>暂无代理节点</h3>
+      <p>请在配置文件中添加代理节点</p>
+    </div>
+    </div><!-- end monitorTab -->
+
+    <!-- 虚拟池页面 -->
+    <div id="vpoolsTab" class="tab-content">
+      <div class="manage-header">
+        <h2>虚拟池管理</h2>
+        <p class="manage-desc">查看和管理虚拟池配置，每个虚拟池通过正则表达式筛选节点</p>
+      </div>
+
+      <div id="vpoolsContainer"></div>
+
+      <div id="vpoolsEmptyState" class="empty" style="display: none;">
+        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" opacity="0.2">
+          <circle cx="32" cy="32" r="30" stroke="currentColor" stroke-width="4"/>
+          <path d="M32 16v32M16 32h32" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+        </svg>
+        <h3>暂无虚拟池</h3>
+        <p>请在配置文件中添加虚拟池配置</p>
+      </div>
+    </div><!-- end vpoolsTab -->
+
+    <!-- 节点管理页面 -->
+    <div id="manageTab" class="tab-content">
+      <div class="manage-header">
+        <h2>节点配置管理</h2>
+        <p class="manage-desc">添加、编辑或删除代理节点。修改后需点击"重载配置"使更改生效。</p>
+      </div>
+
+      <div class="manage-actions">
+        <button class="btn btn-primary" onclick="showAddNodeModal()">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          添加节点
+        </button>
+        <button class="btn btn-warning" onclick="triggerReload()" id="reloadBtn">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M13.65 2.35A7.958 7.958 0 0 0 8 0C3.58 0 0 3.58 0 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L9 7h7V0l-2.35 2.35z" fill="currentColor"/>
+          </svg>
+          重载配置
+        </button>
+      </div>
+
+      <div class="reload-warning">
+        ⚠️ 重载配置会中断所有现有连接，请谨慎操作
+      </div>
+
+      <div id="subscriptionWarning" class="reload-warning" style="display: none; background: rgba(255, 59, 48, 0.1); border-color: rgba(255, 59, 48, 0.3); color: var(--error);">
+        ⚠️ 当前使用订阅模式：您的修改会保存到 nodes.txt，但下次刷新订阅时将被覆盖
+      </div>
+
+      <div id="configNodesContainer" class="config-nodes-grid"></div>
+
+      <div id="configEmptyState" class="empty" style="display: none;">
+        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" opacity="0.2">
+          <circle cx="32" cy="32" r="30" stroke="currentColor" stroke-width="4"/>
+          <path d="M32 16v32M16 32h32" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+        </svg>
+        <h3>暂无配置节点</h3>
+        <p>点击"添加节点"开始配置</p>
+      </div>
+    </div><!-- end manageTab -->
+  </div>
+
+  <div id="toast" class="toast">
+    <span class="toast-message" id="toastMessage"></span>
+  </div>
+
+  <!-- 批量探测进度条 -->
+  <div id="probeProgress" class="probe-progress">
+    <div class="probe-progress-header">
+      <span class="probe-progress-title">⚡ 正在探测所有节点...</span>
+      <span class="probe-progress-stats" id="probeProgressStats">0 / 0</span>
+    </div>
+    <div class="probe-progress-bar">
+      <div class="probe-progress-fill" id="probeProgressFill"></div>
+    </div>
+    <div class="probe-progress-detail">
+      <span>成功: <span class="success" id="probeSuccessCount">0</span></span>
+      <span>失败: <span class="failed" id="probeFailedCount">0</span></span>
+      <span id="probeCurrentNode">准备中...</span>
+    </div>
+  </div>
+
+  <!-- 节点编辑弹窗 -->
+  <div id="nodeModalOverlay" class="login-overlay">
+    <div class="login-modal">
+      <div class="login-header">
+        <h2 id="nodeModalTitle">➕ 添加节点</h2>
+        <p id="nodeModalDesc">输入节点信息</p>
+      </div>
+      <form class="login-form" onsubmit="handleNodeSubmit(event)">
+        <div class="form-group">
+          <label class="form-label" for="nodeName">节点名称</label>
+          <input type="text" id="nodeName" class="form-input" placeholder="例如：香港节点" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="nodeUri">节点 URI <span style="color: var(--error);">*</span></label>
+          <input type="text" id="nodeUri" class="form-input" placeholder="vless://... 或 vmess://..." required />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="nodePort">端口 (可选，Multi-Port 模式自动分配)</label>
+          <input type="number" id="nodePort" class="form-input" placeholder="留空自动分配" min="1" max="65535" />
+        </div>
+        <input type="hidden" id="nodeEditName" />
+        <div id="nodeModalError" class="login-error"></div>
+        <div class="modal-buttons">
+          <button type="button" class="btn btn-secondary" onclick="hideNodeModal()">取消</button>
+          <button type="submit" class="btn btn-primary" id="nodeSubmitBtn">添加</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 设置弹窗 -->
+  <div id="settingsOverlay" class="login-overlay">
+    <div class="login-modal">
+      <div class="login-header">
+        <h2>⚙️ 系统设置</h2>
+        <p>配置全局选项</p>
+      </div>
+      <form class="login-form" onsubmit="handleSettingsSave(event)">
+        <div class="form-group">
+          <label class="form-label" for="settingExternalIP">外部 IP 地址</label>
+          <input type="text" id="settingExternalIP" class="form-input" placeholder="例如：1.2.3.4 或 example.com" />
+          <p class="form-help">导出节点时用于替换 0.0.0.0，留空则使用默认地址</p>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="settingProbeTarget">探测目标</label>
+          <input type="text" id="settingProbeTarget" class="form-input" placeholder="例如：www.apple.com:80" />
+          <p class="form-help">健康检查时使用的目标地址，格式：host:port</p>
+        </div>
+        <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
+          <label class="form-label" for="settingSkipCertVerify" style="margin: 0; flex: 1;">跳过 SSL 证书验证</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settingSkipCertVerify" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <p class="form-help" style="margin-top: -8px;">启用后所有节点将忽略 SSL 证书错误，修改后需重载生效</p>
+        <div id="settingsError" class="login-error"></div>
+        <div class="modal-buttons">
+          <button type="button" class="btn btn-secondary" onclick="hideSettingsModal()">取消</button>
+          <button type="submit" class="btn btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 登录弹窗 -->
+  <div id="loginOverlay" class="login-overlay">
+    <div class="login-modal">
+      <div class="login-header">
+        <h2>🔐 身份验证</h2>
+        <p>请输入访问密码</p>
+      </div>
+      <form class="login-form" onsubmit="handleLogin(event)">
+        <div class="form-group">
+          <label class="form-label" for="password">密码</label>
+          <input
+            type="password"
+            id="password"
+            class="form-input"
+            placeholder="请输入密码"
+            autocomplete="current-password"
+            required
+          />
+        </div>
+        <div id="loginError" class="login-error">密码错误，请重试</div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">
+          登录
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    let autoRefreshInterval = null;
+    let isAutoRefresh = true;
+    let isAuthenticated = false;
+    let allNodes = []; // 存储所有节点数据
+    let currentFilter = ''; // 当前筛选关键字
+    let currentCountry = ''; // 当前选中的国家
+
+    // 国家 emoji 映射
+    const COUNTRY_EMOJIS = [
+      '🇨🇳', '🇭🇰', '🇹🇼', '🇺🇸', '🇨🇦', '🇯🇵', '🇸🇬', '🇦🇺', '🇷🇺',
+      '🇨🇭', '🇩🇪', '🇫🇷', '🇬🇧', '🇳🇱', '🇰🇷', '🇮🇳', '🇹🇭', '🇻🇳',
+      '🇵🇭', '🇮🇩', '🇲🇾', '🇧🇷', '🇦🇷', '🇲🇽', '🇨🇱', '🇨🇴', '🇪🇸',
+      '🇮🇹', '🇵🇱', '🇹🇷', '🇮🇱', '🇦🇪', '🇿🇦', '🇪🇬', '🇳🇬', '🇺🇦',
+      '🇷🇴', '🇨🇿', '🇬🇷', '🇵🇹', '🇸🇪', '🇳🇴', '🇩🇰', '🇫🇮', '🇦🇹',
+      '🇧🇪', '🇮🇪', '🇦🇱', '🇧🇬', '🇷🇸', '🇭🇷', '🇭🇺', '🇸🇰', '🇸🇮',
+      '🇱🇹', '🇱🇻', '🇪🇪', '🇺🇾', '🇵🇾', '🇳🇿', '🇵🇰', '🇧🇩'
+    ];
+
+    // emoji 到中文名称的映射
+    const EMOJI_TO_NAME = {
+      '🇨🇳': '中国', '🇭🇰': '香港', '🇹🇼': '台湾', '🇺🇸': '美国', '🇨🇦': '加拿大',
+      '🇯🇵': '日本', '🇸🇬': '新加坡', '🇦🇺': '澳大利亚', '🇷🇺': '俄罗斯', '🇨🇭': '瑞士',
+      '🇩🇪': '德国', '🇫🇷': '法国', '🇬🇧': '英国', '🇳🇱': '荷兰', '🇰🇷': '韩国',
+      '🇮🇳': '印度', '🇹🇭': '泰国', '🇻🇳': '越南', '🇵🇭': '菲律宾', '🇮🇩': '印度尼西亚',
+      '🇲🇾': '马来西亚', '🇧🇷': '巴西', '🇦🇷': '阿根廷', '🇲🇽': '墨西哥', '🇨🇱': '智利',
+      '🇨🇴': '哥伦比亚', '🇪🇸': '西班牙', '🇮🇹': '意大利', '🇵🇱': '波兰', '🇹🇷': '土耳其',
+      '🇮🇱': '以色列', '🇦🇪': '阿联酋', '🇿🇦': '南非', '🇪🇬': '埃及', '🇳🇬': '尼日利亚',
+      '🇺🇦': '乌克兰', '🇷🇴': '罗马尼亚', '🇨🇿': '捷克', '🇬🇷': '希腊', '🇵🇹': '葡萄牙',
+      '🇸🇪': '瑞典', '🇳🇴': '挪威', '🇩🇰': '丹麦', '🇫🇮': '芬兰', '🇦🇹': '奥地利',
+      '🇧🇪': '比利时', '🇮🇪': '爱尔兰', '🇦🇱': '阿尔巴尼亚', '🇧🇬': '保加利亚', '🇷🇸': '塞尔维亚',
+      '🇭🇷': '克罗地亚', '🇭🇺': '匈牙利', '🇸🇰': '斯洛伐克', '🇸🇮': '斯洛文尼亚', '🇱🇹': '立陶宛',
+      '🇱🇻': '拉脱维亚', '🇪🇪': '爱沙尼亚', '🇺🇾': '乌拉圭', '🇵🇾': '巴拉圭', '🇳🇿': '新西兰',
+      '🇵🇰': '巴基斯坦', '🇧🇩': '孟加拉国', '🌐': '其他'
+    };
+
+    // 从节点名称中提取国家 emoji
+    function extractCountryEmoji(name) {
+      for (const emoji of COUNTRY_EMOJIS) {
+        if (name.includes(emoji)) {
+          return emoji;
+        }
+      }
+      return '🌐'; // 默认图标
+    }
+
+    // 转义 JavaScript 字符串中的特殊字符
+    function escapeForJs(str) {
+      if (!str) return '';
+      return str.replace(/\\/g, '\\\\')
+                .replace(/'/g, "\\'")
+                .replace(/"/g, '\\"')
+                .replace(/\n/g, '\\n')
+                .replace(/\r/g, '\\r');
+    }
+
+    // 复制代理链接到剪贴板
+    function copyProxyLink(tag, listenAddr, port, username, password) {
+      // 如果监听地址是 0.0.0.0 或 ::，尝试使用外部 IP
+      let addr = listenAddr;
+      if (addr === '0.0.0.0' || addr === '::' || !addr) {
+        // 尝试从设置中获取外部 IP
+        fetch('/api/settings')
+          .then(res => res.ok ? res.json() : {})
+          .then(data => {
+            if (data.external_ip) {
+              addr = data.external_ip;
+            } else {
+              addr = window.location.hostname || 'localhost';
+            }
+            buildAndCopyProxyLink(addr, port, username, password);
+          })
+          .catch(() => {
+            addr = window.location.hostname || 'localhost';
+            buildAndCopyProxyLink(addr, port, username, password);
+          });
+      } else {
+        buildAndCopyProxyLink(addr, port, username, password);
+      }
+    }
+
+    // 构建并复制代理链接
+    function buildAndCopyProxyLink(addr, port, username, password) {
+      let proxyLink;
+      if (username && password) {
+        proxyLink = `http://${username}:${password}@${addr}:${port}`;
+      } else {
+        proxyLink = `http://${addr}:${port}`;
+      }
+
+      // 复制到剪贴板
+      navigator.clipboard.writeText(proxyLink)
+        .then(() => {
+          showToast('代理链接已复制到剪贴板', 'success');
+        })
+        .catch(err => {
+          // 降级方案：使用 textarea
+          const textarea = document.createElement('textarea');
+          textarea.value = proxyLink;
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.select();
+          try {
+            document.execCommand('copy');
+            showToast('代理链接已复制到剪贴板', 'success');
+          } catch (e) {
+            showToast('复制失败: ' + e.message, 'error');
+          }
+          document.body.removeChild(textarea);
+        });
+    }
+
+    // 获取国家显示名称（中文）
+    function getCountryName(emoji) {
+      return EMOJI_TO_NAME[emoji] || emoji;
+    }
+
+    // 按国家分组节点
+    function groupNodesByCountry(nodes) {
+      const groups = {};
+      nodes.forEach(node => {
+        const country = extractCountryEmoji(node.name || node.tag);
+        if (!groups[country]) {
+          groups[country] = [];
+        }
+        groups[country].push(node);
+      });
+      return groups;
+    }
+
+    // 筛选输入处理
+    function handleFilterInput() {
+      const input = document.getElementById('filterInput');
+      const clearBtn = document.getElementById('filterClear');
+      currentFilter = input.value.toLowerCase().trim();
+
+      if (currentFilter) {
+        clearBtn.classList.add('show');
+      } else {
+        clearBtn.classList.remove('show');
+      }
+
+      renderFilteredNodes();
+    }
+
+    // 清除筛选
+    function clearFilter() {
+      document.getElementById('filterInput').value = '';
+      document.getElementById('filterClear').classList.remove('show');
+      currentFilter = '';
+      renderFilteredNodes();
+    }
+
+    // 选择国家筛选
+    function selectCountry(country) {
+      if (currentCountry === country) {
+        currentCountry = '';
+      } else {
+        currentCountry = country;
+      }
+      updateCountryFilters();
+      renderFilteredNodes();
+    }
+
+    // 更新国家筛选按钮
+    function updateCountryFilters() {
+      const container = document.getElementById('countryFilters');
+      const groups = groupNodesByCountry(allNodes);
+
+      // 按节点数量排序
+      const sortedCountries = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+
+      container.innerHTML = sortedCountries.map(([country, nodes]) => {
+        const active = currentCountry === country ? 'active' : '';
+        const countryName = getCountryName(country); // 使用中文名称
+        return `
+          <button class="country-filter-btn ${active}" onclick="selectCountry('${country}')">
+            <span>${countryName}</span>
+            <span class="count">${nodes.length}</span>
+          </button>
+        `;
+      }).join('');
+    }
+
+    // 渲染筛选后的节点
+    function renderFilteredNodes() {
+      let filteredNodes = allNodes;
+
+      // 应用关键字筛选
+      if (currentFilter) {
+        filteredNodes = filteredNodes.filter(node => {
+          const name = (node.name || node.tag).toLowerCase();
+          return name.includes(currentFilter);
+        });
+      }
+
+      // 应用国家筛选
+      if (currentCountry) {
+        filteredNodes = filteredNodes.filter(node => {
+          return extractCountryEmoji(node.name || node.tag) === currentCountry;
+        });
+      }
+
+      render(filteredNodes);
+    }
+
+    // 检查是否需要登录
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/nodes');
+        if (res.status === 401) {
+          // 需要登录
+          document.getElementById('loginOverlay').classList.add('show');
+          return false;
+        }
+        return true;
+      } catch (err) {
+        console.error('检查认证状态失败:', err);
+        return false;
+      }
+    }
+
+    // 处理登录
+    async function handleLogin(event) {
+      event.preventDefault();
+      const password = document.getElementById('password').value;
+      const loginError = document.getElementById('loginError');
+
+      loginError.classList.remove('show');
+
+      try {
+        const res = await fetch('/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+          isAuthenticated = true;
+          document.getElementById('loginOverlay').classList.remove('show');
+          showToast('登录成功！', 'success');
+          refresh();
+        } else {
+          loginError.textContent = data.error || '登录失败';
+          loginError.classList.add('show');
+        }
+      } catch (err) {
+        loginError.textContent = '登录失败: ' + err.message;
+        loginError.classList.add('show');
+      }
+    }
+
+    // 导出节点
+    async function exportNodes() {
+      try {
+        const res = await fetch('/api/export');
+        if (res.status === 401) {
+          showToast('请先登录', 'error');
+          document.getElementById('loginOverlay').classList.add('show');
+          return;
+        }
+        if (!res.ok) {
+          throw new Error('导出失败');
+        }
+
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'nodes.txt';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+
+        showToast('节点导出成功！', 'success');
+      } catch (err) {
+        showToast('导出失败: ' + err.message, 'error');
+      }
+    }
+
+    function formatTime(timeStr) {
+      if (!timeStr || timeStr === '0001-01-01T00:00:00Z') return '从未';
+      const date = new Date(timeStr);
+      const now = new Date();
+      const diff = Math.floor((now - date) / 1000);
+      if (diff < 60) return `${diff}秒前`;
+      if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
+      return `${Math.floor(diff / 86400)}天前`;
+    }
+
+    function getLatencyQuality(ms) {
+      if (ms < 0) return { text: '未测试', color: 'var(--text-secondary)' };
+      if (ms < 100) return { text: '优秀', color: 'var(--success)' };
+      if (ms < 200) return { text: '良好', color: 'var(--primary)' };
+      if (ms < 500) return { text: '一般', color: 'var(--warning)' };
+      return { text: '较慢', color: 'var(--error)' };
+    }
+
+    function getNodeStatus(node) {
+      if (node.blacklisted) return 'blacklisted';
+      if (node.failure_count >= 2) return 'error';
+      if (node.failure_count >= 1) return 'warning';
+      return 'healthy';
+    }
+
+    function getStatusText(status) {
+      const map = {
+        'healthy': '健康',
+        'warning': '警告',
+        'error': '异常',
+        'blacklisted': '已拉黑'
+      };
+      return map[status] || '未知';
+    }
+
+    function showToast(message, type = 'success') {
+      const toast = document.getElementById('toast');
+      const toastMessage = document.getElementById('toastMessage');
+      toast.className = `toast ${type} show`;
+      toastMessage.textContent = message;
+      setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/nodes');
+        if (res.status === 401) {
+          // 需要登录
+          isAuthenticated = false;
+          document.getElementById('loginOverlay').classList.add('show');
+          stopAutoRefresh();
+          return;
+        }
+        if (!res.ok) throw new Error('请求失败');
+        const data = await res.json();
+        allNodes = data.nodes || [];
+        updateCountryFilters();
+        renderFilteredNodes();
+        updateStats(allNodes);
+        document.getElementById('lastUpdate').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
+      } catch (err) {
+        showToast('刷新失败: ' + err.message, 'error');
+      }
+    }
+
+    function updateStats(nodes) {
+      document.getElementById('totalNodes').textContent = nodes.length;
+      document.getElementById('healthyNodes').textContent = nodes.filter(n => !n.blacklisted && n.failure_count === 0).length;
+      document.getElementById('activeConnections').textContent = nodes.reduce((sum, n) => sum + (n.active_connections || 0), 0);
+      document.getElementById('blacklistedNodes').textContent = nodes.filter(n => n.blacklisted).length;
+    }
+
+    function render(nodes) {
+      const container = document.getElementById('nodesContainer');
+      const emptyState = document.getElementById('emptyState');
+
+      if (nodes.length === 0) {
+        container.innerHTML = '';
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+      container.innerHTML = nodes.map(node => {
+        const status = getNodeStatus(node);
+        const latency = node.last_latency_ms || -1;
+        const quality = getLatencyQuality(latency);
+
+        return `
+          <div class="node-card ${status}">
+            <div class="node-header">
+              <div class="node-info">
+                <div class="node-name">${node.name || node.tag}</div>
+                <div class="node-tag">${node.tag}</div>
+              </div>
+              <span class="status-badge ${status}">
+                <span class="status-icon"></span>
+                ${getStatusText(status)}
+              </span>
+            </div>
+
+            <div class="latency-display">
+              <div class="latency-info">
+                <div class="latency-icon">⚡</div>
+                <div class="latency-text">
+                  <div class="latency-label">延迟</div>
+                  <div class="latency-value">${latency >= 0 ? latency + 'ms' : '—'}</div>
+                  ${latency >= 0 ? `<div class="latency-quality" style="color: ${quality.color}">${quality.text}</div>` : '<div class="latency-quality">未测试</div>'}
+                </div>
+              </div>
+            </div>
+
+            <div class="metrics">
+              <div class="metric">
+                <div class="metric-label">端口</div>
+                <div class="metric-value">${node.port || '—'}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">连接</div>
+                <div class="metric-value success">${node.active_connections || 0}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">失败</div>
+                <div class="metric-value ${node.failure_count > 0 ? 'error' : ''}">${node.failure_count || 0}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">模式</div>
+                <div class="metric-value" style="font-size: 14px; text-transform: uppercase;">${node.mode || '—'}</div>
+              </div>
+            </div>
+
+            <div class="node-footer">
+              <div class="time-info">
+                <div>✓ ${formatTime(node.last_success)}</div>
+                <div>✗ ${formatTime(node.last_failure)}</div>
+                ${node.blacklisted ? `<div style="color: var(--error);">⚠ 拉黑至 ${new Date(node.blacklisted_until).toLocaleString('zh-CN', {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'})}</div>` : ''}
+              </div>
+              <button class="btn btn-secondary btn-sm" onclick="copyProxyLink('${node.tag}', '${escapeForJs(node.listen_address)}', ${node.port}, '${escapeForJs(node.username || '')}', '${escapeForJs(node.password || '')}')">
+                📋 复制链接
+              </button>
+              <button class="btn btn-secondary btn-sm" onclick="probe('${node.tag}')">
+                🔍 探测
+              </button>
+              ${node.blacklisted ? `
+                <button class="btn btn-primary btn-sm" onclick="release('${node.tag}')">
+                  解除拉黑
+                </button>
+              ` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function probe(tag) {
+      try {
+        showToast('正在探测节点 ' + tag + '...', 'success');
+        const res = await fetch('/api/nodes/' + encodeURIComponent(tag) + '/probe', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          showToast('探测失败: ' + data.error, 'error');
+        } else {
+          showToast(`探测成功！延迟: ${data.latency_ms}ms`, 'success');
+        }
+        setTimeout(refresh, 500);
+      } catch (err) {
+        showToast('探测失败: ' + err.message, 'error');
+      }
+    }
+
+    // 批量探测所有节点
+    let isProbing = false;
+    async function probeAllNodes() {
+      if (isProbing) {
+        showToast('探测正在进行中...', 'error');
+        return;
+      }
+
+      isProbing = true;
+      const btn = document.getElementById('probeAllBtn');
+      btn.disabled = true;
+      btn.textContent = '探测中...';
+
+      // 显示进度条
+      const progressEl = document.getElementById('probeProgress');
+      const progressFill = document.getElementById('probeProgressFill');
+      const progressStats = document.getElementById('probeProgressStats');
+      const successCount = document.getElementById('probeSuccessCount');
+      const failedCount = document.getElementById('probeFailedCount');
+      const currentNode = document.getElementById('probeCurrentNode');
+
+      progressEl.classList.add('show');
+      progressFill.style.width = '0%';
+      progressStats.textContent = '0 / 0';
+      successCount.textContent = '0';
+      failedCount.textContent = '0';
+      currentNode.textContent = '准备中...';
+
+      try {
+        const response = await fetch('/api/nodes/probe-all', { method: 'POST' });
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                handleProbeEvent(data);
+              } catch (e) {
+                console.error('Parse error:', e);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        showToast('批量探测失败: ' + err.message, 'error');
+      } finally {
+        isProbing = false;
+        btn.disabled = false;
+        btn.textContent = '⚡ 探测全部';
+        setTimeout(() => {
+          progressEl.classList.remove('show');
+          refresh();
+        }, 2000);
+      }
+    }
+
+    function handleProbeEvent(data) {
+      const progressFill = document.getElementById('probeProgressFill');
+      const progressStats = document.getElementById('probeProgressStats');
+      const successCountEl = document.getElementById('probeSuccessCount');
+      const failedCountEl = document.getElementById('probeFailedCount');
+      const currentNode = document.getElementById('probeCurrentNode');
+
+      switch (data.type) {
+        case 'start':
+          progressStats.textContent = `0 / ${data.total}`;
+          currentNode.textContent = '开始探测...';
+          break;
+        case 'progress':
+          progressFill.style.width = `${data.progress}%`;
+          progressStats.textContent = `${data.current} / ${data.total}`;
+          if (data.error) {
+            failedCountEl.textContent = parseInt(failedCountEl.textContent) + 1;
+            currentNode.textContent = `❌ ${data.name}: ${data.error}`;
+          } else {
+            successCountEl.textContent = parseInt(successCountEl.textContent) + 1;
+            currentNode.textContent = `✅ ${data.name}: ${data.latency}ms`;
+          }
+          break;
+        case 'complete':
+          progressFill.style.width = '100%';
+          currentNode.textContent = `完成！成功 ${data.success}，失败 ${data.failed}`;
+          showToast(`探测完成！成功 ${data.success} 个，失败 ${data.failed} 个`, 'success');
+          break;
+      }
+    }
+
+    async function release(tag) {
+      try {
+        const res = await fetch('/api/nodes/' + encodeURIComponent(tag) + '/release', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          showToast('释放失败: ' + data.error, 'error');
+        } else {
+          showToast('已解除节点 ' + tag + ' 的拉黑状态', 'success');
+        }
+        setTimeout(refresh, 500);
+      } catch (err) {
+        showToast('释放失败: ' + err.message, 'error');
+      }
+    }
+
+    function toggleAutoRefresh() {
+      isAutoRefresh = !isAutoRefresh;
+      const btn = document.getElementById('autoRefreshText');
+      if (isAutoRefresh) {
+        btn.textContent = '关闭自动刷新';
+        startAutoRefresh();
+        showToast('已开启自动刷新', 'success');
+      } else {
+        btn.textContent = '开启自动刷新';
+        stopAutoRefresh();
+        showToast('已关闭自动刷新', 'success');
+      }
+    }
+
+    function startAutoRefresh() {
+      if (autoRefreshInterval) return;
+      autoRefreshInterval = setInterval(refresh, 10000);
+    }
+
+    function stopAutoRefresh() {
+      if (autoRefreshInterval) {
+        clearInterval(autoRefreshInterval);
+        autoRefreshInterval = null;
+      }
+    }
+
+    // 订阅状态相关
+    async function fetchSubscriptionStatus() {
+      try {
+        const res = await fetch('/api/subscription/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        updateSubscriptionUI(data);
+      } catch (err) {
+        console.error('获取订阅状态失败:', err);
+      }
+    }
+
+    function updateSubscriptionUI(data) {
+      const card = document.getElementById('subscriptionCard');
+      const btn = document.getElementById('refreshSubBtn');
+      const statusEl = document.getElementById('subscriptionStatus');
+      const trendEl = document.getElementById('subscriptionTrend');
+
+      if (!data.enabled) {
+        card.style.display = 'none';
+        btn.style.display = 'none';
+        return;
+      }
+
+      card.style.display = 'block';
+      btn.style.display = 'inline-flex';
+
+      if (data.is_refreshing) {
+        statusEl.textContent = '刷新中...';
+        statusEl.style.color = 'var(--warning)';
+        trendEl.textContent = '正在获取订阅...';
+        return;
+      }
+
+      statusEl.textContent = data.node_count || 0;
+      statusEl.style.color = data.last_error ? 'var(--error)' : 'var(--success)';
+
+      if (data.last_error) {
+        trendEl.textContent = '上次失败: ' + data.last_error;
+        trendEl.style.color = 'var(--error)';
+      } else if (data.last_refresh && data.last_refresh !== '0001-01-01T00:00:00Z') {
+        trendEl.textContent = '上次刷新: ' + formatTime(data.last_refresh);
+        trendEl.style.color = 'var(--success)';
+      } else {
+        trendEl.textContent = '等待首次刷新';
+        trendEl.style.color = 'var(--text-secondary)';
+      }
+    }
+
+    async function refreshSubscription() {
+      // Check if nodes have been modified since last refresh
+      try {
+        const statusRes = await fetch('/api/subscription/status');
+        if (statusRes.ok) {
+          const status = await statusRes.json();
+          if (status.nodes_modified) {
+            const confirmed = confirm(
+              '⚠️ 警告：节点配置已被修改\n\n' +
+              '刷新订阅将会覆盖您对 nodes.txt 的所有修改！\n\n' +
+              '确定要继续吗？'
+            );
+            if (!confirmed) {
+              return;
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore status check errors, proceed with refresh
+      }
+
+      const btn = document.getElementById('refreshSubBtn');
+      const text = document.getElementById('refreshSubText');
+
+      btn.disabled = true;
+      text.textContent = '刷新中...';
+
+      try {
+        const res = await fetch('/api/subscription/refresh', { method: 'POST' });
+        const data = await res.json();
+
+        if (!res.ok) {
+          showToast('订阅刷新失败: ' + (data.error || '未知错误'), 'error');
+        } else {
+          showToast('订阅刷新成功！共 ' + data.node_count + ' 个节点', 'success');
+          setTimeout(() => {
+            refresh();
+            fetchSubscriptionStatus();
+          }, 1000);
+        }
+      } catch (err) {
+        showToast('订阅刷新失败: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        text.textContent = '刷新订阅';
+      }
+    }
+
+    // ========== 系统设置功能 ==========
+
+    function showSettingsModal() {
+      fetch('/api/settings')
+        .then(res => res.ok ? res.json() : {})
+        .then(data => {
+          document.getElementById('settingExternalIP').value = data.external_ip || '';
+          document.getElementById('settingProbeTarget').value = data.probe_target || '';
+          document.getElementById('settingSkipCertVerify').checked = data.skip_cert_verify || false;
+          document.getElementById('settingsError').classList.remove('show');
+          document.getElementById('settingsOverlay').classList.add('show');
+        })
+        .catch(err => {
+          console.error('Failed to load settings', err);
+          document.getElementById('settingsOverlay').classList.add('show');
+        });
+    }
+
+    function hideSettingsModal() {
+      document.getElementById('settingsOverlay').classList.remove('show');
+    }
+
+    async function handleSettingsSave(event) {
+      event.preventDefault();
+      const errorEl = document.getElementById('settingsError');
+      errorEl.classList.remove('show');
+
+      const payload = {
+        external_ip: document.getElementById('settingExternalIP').value.trim(),
+        probe_target: document.getElementById('settingProbeTarget').value.trim(),
+        skip_cert_verify: document.getElementById('settingSkipCertVerify').checked
+      };
+
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          if (data.need_reload) {
+            showToast('设置已保存，SSL 设置需重载生效', 'success');
+          } else {
+            showToast('设置保存成功', 'success');
+          }
+          hideSettingsModal();
+        } else {
+          errorEl.textContent = data.error || '保存失败';
+          errorEl.classList.add('show');
+        }
+      } catch (err) {
+        errorEl.textContent = '保存失败: ' + err.message;
+        errorEl.classList.add('show');
+      }
+    }
+
+    // ========== 节点管理功能 ==========
+
+    let configNodes = [];
+    let isEditMode = false;
+
+    // Tab 切换
+    function switchTab(tabName) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+      document.querySelector(`.tab[onclick="switchTab('${tabName}')"]`).classList.add('active');
+      document.getElementById(tabName + 'Tab').classList.add('active');
+
+      if (tabName === 'manage') {
+        loadConfigNodes();
+      } else if (tabName === 'vpools') {
+        loadVirtualPools();
+      }
+    }
+
+    // 加载虚拟池数据
+    async function loadVirtualPools() {
+      try {
+        const res = await fetch('/api/virtual_pools/status');
+        if (res.status === 401) {
+          showToast('请先登录', 'error');
+          document.getElementById('loginOverlay').classList.add('show');
+          return;
+        }
+        if (!res.ok) throw new Error('加载失败');
+        const data = await res.json();
+        renderVirtualPools(data.pools || []);
+      } catch (err) {
+        showToast('加载虚拟池失败: ' + err.message, 'error');
+      }
+    }
+
+    // 渲染虚拟池列表
+    async function renderVirtualPools(pools) {
+      const container = document.getElementById('vpoolsContainer');
+      const emptyState = document.getElementById('vpoolsEmptyState');
+
+      if (!pools || pools.length === 0) {
+        container.innerHTML = '';
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+
+      // 先渲染基本信息
+      container.innerHTML = pools.map(pool => renderPoolCard(pool, null)).join('');
+
+      // 异步获取每个虚拟池的节点信息并更新
+      for (const pool of pools) {
+        try {
+          const nodes = await fetchPoolNodes(pool.name);
+          const poolCard = document.getElementById('vpool-' + pool.name);
+          if (poolCard) {
+            poolCard.outerHTML = renderPoolCard(pool, nodes);
+          }
+        } catch (err) {
+          console.error('获取虚拟池节点失败:', pool.name, err);
+        }
+      }
+    }
+
+    // 渲染单个虚拟池卡片
+    function renderPoolCard(pool, nodes) {
+      const healthyNodes = nodes ? nodes.filter(n => !n.blacklisted && n.failure_count === 0).length : 0;
+      const totalNodes = pool.node_count || (nodes ? nodes.length : 0);
+      const avgLatency = nodes && nodes.length > 0
+        ? Math.round(nodes.reduce((sum, n) => sum + (n.last_latency_ms || 0), 0) / nodes.length)
+        : 0;
+
+      // 组合监听地址
+      const listenAddr = pool.address && pool.port ? `${pool.address}:${pool.port}` : '—';
+
+      return `
+        <div class="vpool-card" id="vpool-${pool.name}">
+          <div class="vpool-header">
+            <div class="vpool-info">
+              <div class="vpool-name">${escapeHtml(pool.name || '未命名虚拟池')}</div>
+              <div class="vpool-pattern">正则: ${escapeHtml(pool.regular || '.*')}</div>
+            </div>
+          </div>
+
+          <div class="vpool-stats">
+            <div class="vpool-stat">
+              <div class="vpool-stat-label">监听地址</div>
+              <div class="vpool-stat-value" style="font-size: 16px;">${listenAddr}</div>
+            </div>
+            <div class="vpool-stat">
+              <div class="vpool-stat-label">节点数量</div>
+              <div class="vpool-stat-value">${totalNodes}</div>
+            </div>
+            <div class="vpool-stat">
+              <div class="vpool-stat-label">健康节点</div>
+              <div class="vpool-stat-value" style="color: var(--success);">${healthyNodes}</div>
+            </div>
+            <div class="vpool-stat">
+              <div class="vpool-stat-label">平均延迟</div>
+              <div class="vpool-stat-value" style="color: var(--primary);">${avgLatency > 0 ? avgLatency + 'ms' : '—'}</div>
+            </div>
+            <div class="vpool-stat">
+              <div class="vpool-stat-label">选择策略</div>
+              <div class="vpool-stat-value" style="font-size: 14px; text-transform: uppercase;">${pool.strategy || 'random'}</div>
+            </div>
+            ${pool.max_latency_ms && pool.max_latency_ms > 0 ? `
+            <div class="vpool-stat">
+              <div class="vpool-stat-label">延迟阈值</div>
+              <div class="vpool-stat-value" style="font-size: 16px;">${pool.max_latency_ms}ms</div>
+            </div>
+            ` : ''}
+          </div>
+
+          <div style="margin-top: 16px; text-align: center;">
+            <button class="btn btn-primary btn-sm" onclick="copyProxyLink('vpool-${escapeForJs(pool.name)}', '${escapeForJs(pool.address)}', ${pool.port}, '${escapeForJs(pool.username || '')}', '${escapeForJs(pool.password || '')}')">
+              📋 复制虚拟池代理链接
+            </button>
+          </div>
+
+          ${nodes && nodes.length > 0 ? `
+          <div class="vpool-nodes-grid">
+            ${nodes.map(node => {
+              const status = getNodeStatus(node);
+              const latency = node.last_latency_ms || -1;
+              return `
+                <div class="vpool-node-item">
+                  <div class="vpool-node-status ${status}"></div>
+                  <div class="vpool-node-name" title="${escapeHtml(node.name || node.tag)}">${escapeHtml(node.name || node.tag)}</div>
+                  <div class="vpool-node-latency">${latency >= 0 ? latency + 'ms' : '—'}</div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+          ` : '<div style="text-align: center; color: var(--text-secondary); padding: 20px;">' + (nodes === null ? '正在加载节点...' : '暂无匹配节点') + '</div>'}
+        </div>
+      `;
+    }
+
+    // 获取虚拟池的节点列表
+    async function fetchPoolNodes(poolName) {
+      try {
+        const res = await fetch('/api/virtual_pools/' + encodeURIComponent(poolName) + '/nodes');
+        if (!res.ok) return [];
+        const data = await res.json();
+        return data.nodes || [];
+      } catch (err) {
+        console.error('获取虚拟池节点失败:', err);
+        return [];
+      }
+    }
+
+    // 加载配置节点列表
+    async function loadConfigNodes() {
+      try {
+        const res = await fetch('/api/nodes/config');
+        if (res.status === 401) {
+          showToast('请先登录', 'error');
+          document.getElementById('loginOverlay').classList.add('show');
+          return;
+        }
+        if (!res.ok) throw new Error('加载失败');
+        const data = await res.json();
+        configNodes = data.nodes || [];
+        renderConfigNodes();
+
+        // Check if subscription mode is active and show warning
+        const subWarning = document.getElementById('subscriptionWarning');
+        const hasSubscriptionNodes = configNodes.some(n => n.source === 'subscription');
+        if (hasSubscriptionNodes && subWarning) {
+          subWarning.style.display = 'block';
+        } else if (subWarning) {
+          subWarning.style.display = 'none';
+        }
+      } catch (err) {
+        showToast('加载配置节点失败: ' + err.message, 'error');
+      }
+    }
+
+    // 渲染配置节点列表
+    function renderConfigNodes() {
+      const container = document.getElementById('configNodesContainer');
+      const emptyState = document.getElementById('configEmptyState');
+
+      if (configNodes.length === 0) {
+        container.innerHTML = '';
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      emptyState.style.display = 'none';
+      container.innerHTML = configNodes.map((node, index) => {
+        const truncatedUri = node.uri.length > 60 ? node.uri.substring(0, 60) + '...' : node.uri;
+        return `
+          <div class="config-node-card" data-index="${index}">
+            <div class="config-node-info">
+              <div class="config-node-name">${escapeHtml(node.name)}</div>
+              <div class="config-node-uri" title="${escapeHtml(node.uri)}">${escapeHtml(truncatedUri)}</div>
+              ${node.port ? `<div class="config-node-port">端口: ${node.port}</div>` : ''}
+            </div>
+            <div class="config-node-actions">
+              <button class="btn btn-secondary btn-sm" data-action="edit" data-index="${index}">
+                ✏️ 编辑
+              </button>
+              <button class="btn btn-danger btn-sm" data-action="delete" data-index="${index}">
+                🗑️ 删除
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      // 使用事件委托处理按钮点击
+      container.querySelectorAll('button[data-action]').forEach(btn => {
+        btn.addEventListener('click', function() {
+          const index = parseInt(this.dataset.index);
+          const action = this.dataset.action;
+          const node = configNodes[index];
+          if (!node) return;
+          if (action === 'edit') {
+            showEditNodeModal(node.name);
+          } else if (action === 'delete') {
+            deleteNode(node.name);
+          }
+        });
+      });
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // 显示添加节点弹窗
+    function showAddNodeModal() {
+      isEditMode = false;
+      document.getElementById('nodeModalTitle').textContent = '➕ 添加节点';
+      document.getElementById('nodeModalDesc').textContent = '输入节点信息';
+      document.getElementById('nodeSubmitBtn').textContent = '添加';
+      document.getElementById('nodeName').value = '';
+      document.getElementById('nodeUri').value = '';
+      document.getElementById('nodePort').value = '';
+      document.getElementById('nodeEditName').value = '';
+      document.getElementById('nodeModalError').classList.remove('show');
+      document.getElementById('nodeModalOverlay').classList.add('show');
+    }
+
+    // 显示编辑节点弹窗
+    function showEditNodeModal(name) {
+      const node = configNodes.find(n => n.name === name);
+      if (!node) return;
+
+      isEditMode = true;
+      document.getElementById('nodeModalTitle').textContent = '✏️ 编辑节点';
+      document.getElementById('nodeModalDesc').textContent = '修改节点信息';
+      document.getElementById('nodeSubmitBtn').textContent = '保存';
+      document.getElementById('nodeName').value = node.name;
+      document.getElementById('nodeUri').value = node.uri;
+      document.getElementById('nodePort').value = node.port || '';
+      document.getElementById('nodeEditName').value = name;
+      document.getElementById('nodeModalError').classList.remove('show');
+      document.getElementById('nodeModalOverlay').classList.add('show');
+    }
+
+    // 隐藏节点弹窗
+    function hideNodeModal() {
+      document.getElementById('nodeModalOverlay').classList.remove('show');
+    }
+
+    // 处理节点表单提交
+    async function handleNodeSubmit(event) {
+      event.preventDefault();
+      const errorEl = document.getElementById('nodeModalError');
+      errorEl.classList.remove('show');
+
+      const payload = {
+        name: document.getElementById('nodeName').value.trim(),
+        uri: document.getElementById('nodeUri').value.trim(),
+        port: parseInt(document.getElementById('nodePort').value) || 0
+      };
+
+      if (!payload.uri) {
+        errorEl.textContent = 'URI 不能为空';
+        errorEl.classList.add('show');
+        return;
+      }
+
+      try {
+        let res;
+        if (isEditMode) {
+          const editName = document.getElementById('nodeEditName').value;
+          res = await fetch('/api/nodes/config/' + encodeURIComponent(editName), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+        } else {
+          res = await fetch('/api/nodes/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+        }
+
+        const data = await res.json();
+        if (!res.ok) {
+          errorEl.textContent = data.error || '操作失败';
+          errorEl.classList.add('show');
+          return;
+        }
+
+        hideNodeModal();
+        showToast(data.message || (isEditMode ? '节点已更新' : '节点已添加'), 'success');
+        loadConfigNodes();
+      } catch (err) {
+        errorEl.textContent = '操作失败: ' + err.message;
+        errorEl.classList.add('show');
+      }
+    }
+
+    // 删除节点
+    async function deleteNode(name) {
+      if (!confirm(`确定要删除节点 "${name}" 吗？`)) return;
+
+      try {
+        const res = await fetch('/api/nodes/config/' + encodeURIComponent(name), {
+          method: 'DELETE'
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showToast(data.error || '删除失败', 'error');
+          return;
+        }
+        showToast(data.message || '节点已删除', 'success');
+        loadConfigNodes();
+      } catch (err) {
+        showToast('删除失败: ' + err.message, 'error');
+      }
+    }
+
+    // 触发重载
+    async function triggerReload() {
+      if (!confirm('重载配置会中断所有现有连接，确定要继续吗？')) return;
+
+      const btn = document.getElementById('reloadBtn');
+      btn.disabled = true;
+      btn.textContent = '重载中...';
+
+      try {
+        const res = await fetch('/api/reload', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+          showToast(data.error || '重载失败', 'error');
+          return;
+        }
+        showToast(data.message || '重载成功', 'success');
+        // 刷新监控数据
+        setTimeout(() => {
+          refresh();
+          loadConfigNodes();
+        }, 2000);
+      } catch (err) {
+        showToast('重载失败: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M13.65 2.35A7.958 7.958 0 0 0 8 0C3.58 0 0 3.58 0 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L9 7h7V0l-2.35 2.35z" fill="currentColor"/>
+          </svg>
+          重载配置
+        `;
+      }
+    }
+
+    // 初始化
+    (async function init() {
+      const authenticated = await checkAuth();
+      if (authenticated) {
+        isAuthenticated = true;
+        refresh();
+        fetchSubscriptionStatus();
+        startAutoRefresh();
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+# Binaries
+easy-proxies
+easy-proxies-*
+easy_proxies
+easy_proxies-*
+*.exe
+
+# Configuration (contains sensitive data)
+config.yaml
+nodes.txt
+
+# Logs
+*.log
+
+# IDE and editor
+.idea/
+.vscode/
+.serena/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Go
+vendor/
+
+# Test artifacts
+coverage.out
+coverage.html
+
+# Qodo
+.qodo/
+CLAUDE.md
+/.claude
+PLAN.md
+start.bat
+test.py
+.ace-tool/
