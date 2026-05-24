@@ -1,13 +1,25 @@
-name: Build and Push Docker Images
+name: Build and Push Multi-Arch Docker Images
+
 on:
   push:
+    branches: [ main, master ]     # 推送 commit 到 main/master 时自动构建（使用短 SHA）
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0 或自定义版本)'
+        required: true
+        default: 'latest'
+
 permissions:
   contents: read
   packages: write
+
 jobs:
   build:
     runs-on: ${{ matrix.runner }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -18,17 +30,44 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-22.04-arm
             arch: arm64
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # === 关键修复：统一处理小写 + 版本逻辑 ===
+      - name: Prepare variables
+        id: prep
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          
+          # 版本优先级：手动输入 > tag > commit SHA（短7位）
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION=$(git rev-parse --short HEAD)   # 短 commit SHA，如 c20bc77
+          fi
+
+          echo "OWNER_LC=${OWNER_LC}" >> $GITHUB_ENV
+          echo "REPO_LC=${REPO_LC}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "IMAGE=ghcr.io/${OWNER_LC}/${REPO_LC}" >> $GITHUB_ENV
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ env.OWNER_LC }}        # 使用小写后的 owner
           password: ${{ github.token }}
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -37,7 +76,66 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
-          tags: ghcr.io/${{ github.repository }}:latest-${{ matrix.arch }}
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Kiro.rs Docker Image
+            org.opencontainers.image.description=${{ github.event.repository.description }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare variables
+        id: prep
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION=$(echo "${{ github.sha }}" | cut -c1-7)
+          fi
+
+          echo "OWNER_LC=${OWNER_LC}" >> $GITHUB_ENV
+          echo "REPO_LC=${REPO_LC}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "IMAGE=ghcr.io/${OWNER_LC}/${REPO_LC}" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ env.OWNER_LC }}
+          password: ${{ github.token }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          IMAGE="${{ env.IMAGE }}"
+          VERSION="${{ env.VERSION }}"
+
+          echo "🚀 Creating multi-arch manifest for ${IMAGE}:${VERSION}"
+
+          # 创建版本 manifest
+          docker manifest create ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:${VERSION}
+
+          # 只有 tag 或手动触发时才更新 :latest
+          if [[ "${{ github.ref_type }}" == "tag" ]] || [[ -n "${{ github.event.inputs.version }}" ]]; then
+            docker manifest create ${IMAGE}:latest \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:latest
+            echo "✅ Also updated :latest"
+          fi
+
+          echo "🎉 Success!"
+          echo "   Image: ${IMAGE}:${VERSION} (amd64 + arm64)"
