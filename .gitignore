@@ -1,8 +1,8 @@
 # Binaries
-easy-proxies
-easy-proxies-*
-easy_proxies
-easy_proxies-*
+/easy-proxies
+/easy-proxies-*
+/easy_proxies
+/easy_proxies-*
 *.exe
 
 # Configuration (contains sensitive data)
