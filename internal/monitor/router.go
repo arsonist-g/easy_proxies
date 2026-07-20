@@ -22,7 +22,11 @@ func newRouter(s *Server) http.Handler {
 	prefix := ""
 	if s.cfg.PathPwd != "" {
 		prefix = "/" + strings.Trim(s.cfg.PathPwd, "/")
-		r.Get(prefix, s.serveHTML("index"))
+		// 无尾斜杠访问 → 重定向到带尾斜杠：确保前端相对 URL（location.replace('dashboard') 等）
+		// 基于 /{pwd}/ 目录解析。否则 /{pwd} 被当文件、目录退回 /，相对跳转到 /dashboard（丢前缀 → 登录后不跳转）
+		r.Get(prefix, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, prefix+"/", http.StatusFound)
+		})
 		r.Get(prefix+"/", s.serveHTML("index"))
 	} else {
 		r.Get("/", s.serveHTML("index"))
@@ -105,13 +109,20 @@ func newRouter(s *Server) http.Handler {
 		})
 	})
 
-	// 兜底：/api/* 旧路径 → 404；/assets/ 缺失 → 真 404（不回 index，否则吞字体/css）；其他 → 登录首页
+	// 兜底：/api/* 旧路径 → 404；/assets/ 缺失 → 真 404（不回 index，否则吞字体/css）；
+	// path_pwd 非空时，只有 /{pwd}/... 前缀下的未知路径回 index（SPA fallback），根 / 及其他
+	// 路径 → 404（隐藏入口，不暴露登录页）；path_pwd 空时所有未知路径回 index
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		path := r.URL.Path
+		if strings.HasPrefix(path, "/api/") {
 			respondError(w, r, http.StatusNotFound, CodeNotFound, "端点不存在（已迁移到 /api/v1）")
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/assets/") {
+		if strings.HasPrefix(path, "/assets/") {
+			http.NotFound(w, r)
+			return
+		}
+		if prefix != "" && !(path == prefix || strings.HasPrefix(path, prefix+"/")) {
 			http.NotFound(w, r)
 			return
 		}
