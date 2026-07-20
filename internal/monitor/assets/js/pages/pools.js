@@ -42,6 +42,7 @@ function renderPoolsPage(){
     return `<tr class="${cls}">
       <td style="font-weight:600">${esc(pl.name)}</td>
       <td class="mono">${esc(pl.regular||'—')}</td>
+      <td>${poolCountriesCell(pl)}</td>
       <td class="mono">:${pl.port||'—'}</td>
       <td>${pl.strategy?`<span class="badge badge-neutral">${esc(strategyLabel(pl.strategy))}</span>`:'—'}</td>
       <td class="mono">${pl.node_count||0}</td>
@@ -56,7 +57,7 @@ function renderPoolsPage(){
     </tr>`;
   }).join('');
   document.getElementById('pools-table').innerHTML = `<div class="table-wrap"><table>
-    <thead><tr><th>名称</th><th>正则</th><th>监听</th><th>策略</th><th>匹配节点</th><th>状态</th><th></th></tr></thead>
+    <thead><tr><th>名称</th><th>正则</th><th>国家</th><th>监听</th><th>策略</th><th>匹配节点</th><th>状态</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
   renderPagination('vp-pagination', { total, page:p, page_size:pageSize }, (np) => { vpListState.page = np; renderPoolsPage(); });
 }
@@ -68,6 +69,22 @@ const STRATEGY_OPTIONS = [
   {v:'weighted',   l:'智能加权（延迟+可用率）'},
 ];
 function strategyLabel(s){ const o = STRATEGY_OPTIONS.find(x=>x.v===s); return o ? o.l : (s || '—'); }
+// 虚拟池列表"国家"列：国旗 emoji + 国名；包含=绿、排除=红；多于 6 个截断 +N（hover 显示全部）
+function poolCountriesCell(pl){
+  const inc = pl.country_codes || [], exc = pl.excluded_country_codes || [];
+  if(!inc.length && !exc.length) return '<span class="muted">全部国家</span>';
+  const MAX = 6;
+  const chip = (code, kind) => `<span class="vp-cc vp-cc-${kind}" title="${esc(countryName(code))}（${kind==='inc'?'包含':'排除'}）"><span class="flag">${flag(code)}</span><span class="vp-cc-n">${esc(countryName(code))}</span></span>`;
+  const more = (list) => `<span class="vp-cc-more" title="${esc(list.map(countryName).join('、'))}">+${list.length-MAX}</span>`;
+  let parts = inc.slice(0,MAX).map(c => chip(c,'inc'));
+  if(inc.length > MAX) parts.push(more(inc));
+  if(exc.length){
+    parts.push('<span class="vp-cc-label">⊘ 排除</span>');
+    parts = parts.concat(exc.slice(0,MAX).map(c => chip(c,'exc')));
+    if(exc.length > MAX) parts.push(more(exc));
+  }
+  return `<div class="vp-cc-wrap">${parts.join('')}</div>`;
+}
 
 /* ===== 国家选择器 ===== */
 let COUNTRY_MAP = null; // code -> {name, code, count}；null 表示未加载

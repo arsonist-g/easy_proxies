@@ -48,7 +48,14 @@ func (m *Manager) Start() error {
 
 	logger.Infof("📦 Starting %d virtual pool(s)...", len(m.cfg.VirtualPools))
 
-	for _, poolCfg := range m.cfg.VirtualPools {
+	for i := range m.cfg.VirtualPools {
+		// 加载时补齐 id：config 里 id=0（历史/手写/旧迁移）的池分配稳定唯一 id，
+		// 保证 CRUD 按 id 路由——否则多池 id=0 时前端 find(x=>x.id===id) 总命中第一个，
+		// 导致编辑/删除/查看节点错乱、编辑弹窗回显成第一个池的配置
+		if m.cfg.VirtualPools[i].ID == 0 {
+			m.cfg.VirtualPools[i].ID = m.nextPoolIDLocked()
+		}
+		poolCfg := m.cfg.VirtualPools[i]
 		pool, err := NewVirtualPool(m.ctx, poolCfg, m.monitorMgr, m.cfg)
 		if err != nil {
 			// 关闭已启动的池
@@ -69,8 +76,8 @@ func (m *Manager) Start() error {
 		m.pools[poolCfg.Name] = pool
 		// 获取匹配的节点数量
 		nodeCount := len(pool.GetMatchingNodes())
-		logger.Infof("✅ Virtual pool %q started on %s:%d (strategy: %s, nodes: %d)",
-			poolCfg.Name, poolCfg.Address, poolCfg.Port, poolCfg.Strategy, nodeCount)
+		logger.Infof("✅ Virtual pool %q (id=%d) started on %s:%d (strategy: %s, nodes: %d)",
+			poolCfg.Name, poolCfg.ID, poolCfg.Address, poolCfg.Port, poolCfg.Strategy, nodeCount)
 	}
 
 	return nil
