@@ -253,8 +253,11 @@ func (s *Server) serveHTML(page string) http.HandlerFunc {
 	}
 }
 
-// serveAssets 服务 /assets/{css,js,fonts}/*：immutable 长缓存（路径固定，内容随构建变更）。
+// serveAssets 服务 /assets/{css,js,fonts}/*：no-cache（每次 revalidate，命中则 304，便宜）。
 // 静态资源始终挂在根 /assets/，不受 path_pwd 影响（HTML 用绝对路径 /assets/... 引用）。
+// 注意：文件名固定但内容随构建变更，绝不能用 immutable/长 max-age——否则 CDN（如 Cloudflare）
+// 与浏览器会缓存旧版，部署后用户长期看不到新前端（实测被 CF 缓存 1 小时仍返回旧 pools.js）。
+// 依赖 http.FileServer 的 Last-Modified + If-Modified-Since 做条件请求。
 func (s *Server) serveAssets() http.Handler {
 	sub, err := fs.Sub(embeddedFS, "assets")
 	if err != nil {
@@ -262,7 +265,7 @@ func (s *Server) serveAssets() http.Handler {
 	}
 	fileServer := http.FileServer(http.FS(sub))
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("Cache-Control", "no-cache")
 		fileServer.ServeHTTP(w, r)
 	})
 	return http.StripPrefix("/assets/", inner)
