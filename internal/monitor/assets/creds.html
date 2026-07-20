@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>凭证 · Easy Proxies</title>
+<link rel="stylesheet" href="/assets/css/app.css">
+</head>
+<body data-page="creds">
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <div class="page-head">
+      <div>
+        <button class="btn btn-secondary btn-sm mobile-toggle" onclick="toggleSidebar()">☰</button>
+        <h1 style="display:inline">凭证</h1>
+        <div class="sub">API Key 管理接口 · 订阅 token 代理列表</div>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h3 style="font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-secondary)">API Key</h3>
+        <button class="btn btn-primary btn-sm" onclick="apiKeyCreateModal()">+ 新建 API Key</button>
+      </div>
+      <div id="apikeys-table"></div>
+      <div class="pagination" id="apikeys-pagination" style="display:none"></div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h3 style="font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-secondary)">订阅 Token（代理列表）</h3>
+        <button class="btn btn-primary btn-sm" onclick="subTokenCreateModal()">+ 新建 Token</button>
+      </div>
+      <div id="subtokens-table"></div>
+      <div class="pagination" id="subtokens-pagination" style="display:none"></div>
+    </div>
+  </main>
+</div>
+<script src="/assets/js/app.js"></script>
+<script src="/assets/js/modal.js"></script>
+<script src="/assets/js/pagination.js"></script>
+<script src="/assets/js/pages/creds.js"></script>
+</body>
+</html>

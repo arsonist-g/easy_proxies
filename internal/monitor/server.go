@@ -3,10 +3,12 @@ package monitor
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log"
 	"net/http"
 	"sync"
@@ -17,7 +19,7 @@ import (
 	"easy_proxies/internal/store"
 )
 
-//go:embed assets/index.html
+//go:embed all:assets
 var embeddedFS embed.FS
 
 // NodeManager exposes config node CRUD and reload operations.
@@ -229,14 +231,41 @@ func (s *Server) Shutdown(ctx context.Context) {
 	_ = s.srv.Shutdown(ctx)
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	data, err := embeddedFS.ReadFile("assets/index.html")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+// serveHTML 服务 assets/{page}.html：no-cache + ETag（内容 sha256 前 8 字节），支持 If-None-Match→304。
+// F5 命中 304 不重新下载，但每次都发条件请求校验最新（解决 P4 必须强刷的问题）。
+func (s *Server) serveHTML(page string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := embeddedFS.ReadFile("assets/" + page + ".html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		sum := sha256.Sum256(data)
+		etag := `"` + page + "-" + hex.EncodeToString(sum[:8]) + `"`
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		w.Header().Set("ETag", etag)
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write(data)
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(data)
+}
+
+// serveAssets 服务 /assets/{css,js,fonts}/*：immutable 长缓存（路径固定，内容随构建变更）。
+// 静态资源始终挂在根 /assets/，不受 path_pwd 影响（HTML 用绝对路径 /assets/... 引用）。
+func (s *Server) serveAssets() http.Handler {
+	sub, err := fs.Sub(embeddedFS, "assets")
+	if err != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	}
+	fileServer := http.FileServer(http.FS(sub))
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		fileServer.ServeHTTP(w, r)
+	})
+	return http.StripPrefix("/assets/", inner)
 }
 
 // handleLogin POST /api/v1/auth/login：密码换 session cookie。

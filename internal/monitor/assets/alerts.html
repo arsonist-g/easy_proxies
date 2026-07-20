@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>告警 · Easy Proxies</title>
+<link rel="stylesheet" href="/assets/css/app.css">
+</head>
+<body data-page="alerts">
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <div class="page-head">
+      <div>
+        <button class="btn btn-secondary btn-sm mobile-toggle" onclick="toggleSidebar()">☰</button>
+        <h1 style="display:inline">告警</h1>
+        <div class="sub">运行时检测 · 不持久化</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-secondary btn-sm" id="alerts-refresh">↻ 刷新</button>
+      </div>
+    </div>
+    <div id="alerts-body"></div>
+  </main>
+</div>
+<script src="/assets/js/app.js"></script>
+<script src="/assets/js/modal.js"></script>
+<script src="/assets/js/pagination.js"></script>
+<script src="/assets/js/pages/alerts.js"></script>
+</body>
+</html>

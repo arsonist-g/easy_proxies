@@ -118,6 +118,14 @@ type Manager struct {
 	cancel     context.CancelFunc
 	logger     Logger
 	tracker    *availability.Tracker // 可用率统计（转发/探测计数），可空
+
+	// 探测进度（P8）：手动 /probe/all 与周期健康检查共用 probeAllNodes，
+	// 前端轮询 GET /probe/progress 展示 x/y 进度。running/时间戳由 mu 保护，计数用 atomic。
+	probeRunning         bool
+	probeStartedAt       time.Time
+	probeLastCompletedAt time.Time
+	probeTotal           atomic.Int64
+	probeProbed          atomic.Int64
 }
 
 // Logger interface for logging
@@ -226,6 +234,27 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		return
 	}
 
+	// P8: 置位探测进度，防止手动 /probe/all 与周期健康检查并发重复探测（只跑一轮，另一路直接跳过）。
+	m.mu.Lock()
+	if m.probeRunning {
+		m.mu.Unlock()
+		if m.logger != nil {
+			m.logger.Info("health check already running, skip")
+		}
+		return
+	}
+	m.probeRunning = true
+	m.probeStartedAt = time.Now()
+	m.probeTotal.Store(int64(len(entries)))
+	m.probeProbed.Store(0)
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.probeRunning = false
+		m.probeLastCompletedAt = time.Now()
+		m.mu.Unlock()
+	}()
+
 	if m.logger != nil {
 		m.logger.Info("starting health check for ", len(entries), " nodes")
 	}
@@ -276,6 +305,9 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 			sid := entry.info.StableID
 			entry.mu.Unlock()
 
+			// P8: 探测进度计数（成功/失败均算一次完成）
+			m.probeProbed.Add(1)
+
 			// 记录可用率（probe 路），无锁 atomic，不阻塞热路径
 			if m.tracker != nil && sid != "" {
 				m.tracker.RecordProbe(sid, err == nil)
@@ -299,6 +331,29 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 // ProbeAll 触发一次全节点健康探测（API POST /probe/all 用）。
 func (m *Manager) ProbeAll(timeout time.Duration) {
 	m.probeAllNodes(timeout)
+}
+
+// ProbeProgress 探测进度（P8，GET /probe/progress 用）。
+// Running=true 表示探测进行中，Probed/Total 为本轮已探测/总数；LastCompletedAt 为上一轮完成时间。
+type ProbeProgress struct {
+	Running         bool      `json:"running"`
+	Total           int64     `json:"total"`
+	Probed          int64     `json:"probed"`
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	LastCompletedAt time.Time `json:"last_completed_at,omitempty"`
+}
+
+// Progress 读取探测进度（线程安全）。
+func (m *Manager) Progress() ProbeProgress {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return ProbeProgress{
+		Running:         m.probeRunning,
+		Total:           m.probeTotal.Load(),
+		Probed:          m.probeProbed.Load(),
+		StartedAt:       m.probeStartedAt,
+		LastCompletedAt: m.probeLastCompletedAt,
+	}
 }
 
 // Stop stops the periodic health check.

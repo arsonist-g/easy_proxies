@@ -237,22 +237,28 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleNodeProbe POST /api/v1/nodes/{stable_id}/probe：同步探测单节点。
+// 节点不存在 → 404；探测失败（节点存在但超时/连不上/TLS 错误）→ 200 + success:false + 真实原因（P1），
+// 让前端就地显示失败态，而非含糊的"资源不存在"。
 func (s *Server) handleNodeProbe(w http.ResponseWriter, r *http.Request) {
 	stableID := chi.URLParam(r, "stable_id")
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	latency, err := s.mgr.ProbeByStableID(ctx, stableID)
-	if err != nil {
+	// 先判存在：stable_id 找不到才是真"资源不存在"
+	if _, ok := s.mgr.SnapshotByStableID(stableID); !ok {
 		respondAPIError(w, r, errNotFoundAPI)
 		return
 	}
-	// 回带完整快照供前端就地刷新整行（延迟/可用率/状态/国家/ASN），
-	// 避免 loadNodes() 全量重建导致探测后节点跳位。
-	resp := map[string]any{
-		"stable_id":  stableID,
-		"latency_ms": latency.Milliseconds(),
-		"success":    true,
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	latency, err := s.mgr.ProbeByStableID(ctx, stableID)
+	resp := map[string]any{"stable_id": stableID}
+	if err != nil {
+		// 探测失败：HTTP 200 + success:false + 底层原因，前端就地刷新该行为失败态
+		resp["success"] = false
+		resp["error"] = err.Error()
+	} else {
+		resp["success"] = true
+		resp["latency_ms"] = latency.Milliseconds()
 	}
+	// 回带探测后最新快照供前端就地刷新整行（延迟/可用率/状态/国家/ASN）
 	if snap, ok := s.mgr.SnapshotByStableID(stableID); ok {
 		resp["node"] = snap
 	}
@@ -266,4 +272,10 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		"message": "全节点探测已触发",
 		"status":  "running",
 	})
+}
+
+// handleProbeProgress GET /api/v1/probe/progress：返回当前/最近一次全节点探测进度（P8）。
+// 前端触发 /probe/all 后轮询此端点，展示 x/y 进度，running=false 提示本轮完成。
+func (s *Server) handleProbeProgress(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.mgr.Progress())
 }

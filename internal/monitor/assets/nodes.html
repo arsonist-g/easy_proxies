@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>节点 · Easy Proxies</title>
+<link rel="stylesheet" href="/assets/css/app.css">
+</head>
+<body data-page="nodes">
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <div class="page-head">
+      <div>
+        <button class="btn btn-secondary btn-sm mobile-toggle" onclick="toggleSidebar()">☰</button>
+        <h1 style="display:inline">节点</h1>
+        <div class="sub" id="nodes-sub">所有节点</div>
+      </div>
+      <div class="page-actions">
+        <button class="btn btn-primary btn-sm" onclick="nodeCreateModal()">+ 添加节点</button>
+      </div>
+    </div>
+    <div class="filter-bar" id="nodes-filter"></div>
+    <div id="nodes-table"></div>
+    <div class="pagination" id="nodes-pagination" style="display:none"></div>
+  </main>
+</div>
+<script src="/assets/js/app.js"></script>
+<script src="/assets/js/modal.js"></script>
+<script src="/assets/js/pagination.js"></script>
+<script src="/assets/js/pages/nodes.js"></script>
+</body>
+</html>

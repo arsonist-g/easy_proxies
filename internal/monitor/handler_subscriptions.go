@@ -32,6 +32,24 @@ func (s *Server) handleSubscriptionsList(w http.ResponseWriter, r *http.Request)
 		respondStoreErr(w, r, err)
 		return
 	}
+	// P2: 实时聚合每个订阅的节点数（cfgSrc.Nodes 已带 SubscriptionID），覆盖 bbolt 缓存值。
+	// 避免启动后/刷新中 NodeCount 恒 0 的显示问题。
+	s.cfgMu.RLock()
+	cfg := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if cfg != nil && len(subs) > 0 {
+		counts := make(map[uint64]int, len(subs))
+		for _, n := range cfg.Nodes {
+			if n.SubscriptionID != 0 {
+				counts[n.SubscriptionID]++
+			}
+		}
+		for i := range subs {
+			if c, ok := counts[subs[i].ID]; ok {
+				subs[i].NodeCount = c
+			}
+		}
+	}
 	sort.Slice(subs, func(i, j int) bool { return subs[i].ID < subs[j].ID })
 	page, pageSize, offset := parsePage(r)
 	total := len(subs)

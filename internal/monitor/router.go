@@ -18,14 +18,22 @@ func newRouter(s *Server) http.Handler {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 
-	// HTML 入口（可选路径密码保护；API 始终在 /api/v1 下，不受影响）
+	// HTML 入口（可选路径密码保护；API 始终在 /api/v1，静态资源始终在 /assets，均不受 path_pwd 影响）
+	prefix := ""
 	if s.cfg.PathPwd != "" {
-		custom := "/" + strings.Trim(s.cfg.PathPwd, "/")
-		r.Get(custom, s.handleIndex)
-		r.Get(custom+"/", s.handleIndex)
+		prefix = "/" + strings.Trim(s.cfg.PathPwd, "/")
+		r.Get(prefix, s.serveHTML("index"))
+		r.Get(prefix+"/", s.serveHTML("index"))
 	} else {
-		r.Get("/", s.handleIndex)
+		r.Get("/", s.serveHTML("index"))
 	}
+	// 各功能页（pjax + 真 URL）：canonical 无后缀（/alerts），保留 .html 兼容旧书签/直链
+	for _, pg := range []string{"dashboard", "nodes", "subs", "pools", "creds", "alerts", "settings"} {
+		r.Get(prefix+"/"+pg, s.serveHTML(pg))
+		r.Get(prefix+"/"+pg+".html", s.serveHTML(pg))
+	}
+	// 静态资源（/assets/* 始终根，HTML 用绝对路径 /assets/... 引用）
+	r.Get("/assets/*", s.serveAssets().ServeHTTP)
 
 	// 订阅 token 代理列表（独立鉴权路径，阶段3 实装）
 	r.Group(func(r chi.Router) {
@@ -56,6 +64,7 @@ func newRouter(s *Server) http.Handler {
 			r.Delete("/nodes/{stable_id}", s.handleNodeDelete)
 			r.Post("/nodes/{stable_id}/probe", s.handleNodeProbe)
 			r.Post("/probe/all", s.handleProbeAll)
+			r.Get("/probe/progress", s.handleProbeProgress)
 
 			// 订阅
 			r.Get("/subscriptions", s.handleSubscriptionsList)
@@ -96,13 +105,17 @@ func newRouter(s *Server) http.Handler {
 		})
 	})
 
-	// 兜底：未匹配的路径回退到首页（SPA 友好），但 /api/* 旧路径返回 404
+	// 兜底：/api/* 旧路径 → 404；/assets/ 缺失 → 真 404（不回 index，否则吞字体/css）；其他 → 登录首页
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			respondError(w, r, http.StatusNotFound, CodeNotFound, "端点不存在（已迁移到 /api/v1）")
 			return
 		}
-		s.handleIndex(w, r)
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			http.NotFound(w, r)
+			return
+		}
+		s.serveHTML("index")(w, r)
 	})
 
 	return r
