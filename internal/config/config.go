@@ -1,7 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +13,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"easy_proxies/internal/logger"
@@ -22,7 +27,6 @@ import (
 // Config describes the high level settings for the proxy pool server.
 type Config struct {
 	Mode                string                    `yaml:"mode"`
-	Listener            ListenerConfig            `yaml:"listener"`
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
 	Management          ManagementConfig          `yaml:"management"`
@@ -30,13 +34,19 @@ type Config struct {
 	VirtualPools        []VirtualPoolConfig       `yaml:"virtual_pools"`        // 虚拟池配置列表
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
-	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
+	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表（迁移源，实体化后走 bbolt）
 	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`         // 应用日志级别 (debug/info/warn/error)
 	SingboxLogLevel     string                    `yaml:"singbox_log_level"` // sing-box 核心日志级别，默认 warn
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
+	AlertEnabled        *bool                     `yaml:"alert_enabled"`   // 安全告警开关（空密码检测），默认 true
+	GeoIP               GeoIPConfig               `yaml:"geoip"`           // 可选本地 MaxMind GeoLite2-ASN，空=禁用
+	VirtualPool         VirtualPoolSettings       `yaml:"virtual_pool"`    // 虚拟池全局设置（端口起点等）
+	CredentialKey       string                    `yaml:"credential_key"`  // 凭证加密密钥（AES-256 hex），解密 db 中密文用；与 db 文件分离
 
 	filePath string `yaml:"-"` // 配置文件路径，用于保存
+
+	saveMu *sync.Mutex `yaml:"-"` // 串行化各 Save* 的“读-改-写”，防跨 manager 写同一文件 lost update；指针避免 Config 值拷贝触发 vet
 }
 
 // ListenerConfig defines how the HTTP proxy should listen for clients.
@@ -47,11 +57,61 @@ type ListenerConfig struct {
 	Password string `yaml:"password"`
 }
 
-// PoolConfig configures scheduling + failure handling.
+// PoolConfig 配置节点池的调度策略与代理入口（pool/hybrid 模式的统一入口）。
+// ListenerConfig 以 inline 内嵌：address/port/username/password 直接出现在 pool 段下，
+// 与 multi_port 的扁平结构保持一致（原顶层 listener 段已废弃）。
 type PoolConfig struct {
-	Mode              string        `yaml:"mode"`
-	FailureThreshold  int           `yaml:"failure_threshold"`
-	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
+	Mode               string        `yaml:"mode"`
+	FailureThreshold   int           `yaml:"failure_threshold"`
+	BlacklistDuration  time.Duration `yaml:"blacklist_duration"`
+	LatencyWeight      float64       `yaml:"latency_weight,omitempty"`      // Mode=weighted：延迟权重（>0，内部归一化）
+	AvailabilityWeight float64       `yaml:"availability_weight,omitempty"` // Mode=weighted：可用率权重（>0）
+	ListenerConfig     `yaml:",inline"` // 节点池代理入口（address/port/username/password）
+}
+
+// validatePoolMode 校验主出站池调度模式合法性；weighted 模式要求两个权重均 >0。
+func validatePoolMode(p PoolConfig) error {
+	switch p.Mode {
+	case "sequential", "random", "balance":
+		// 有效模式
+	case "weighted":
+		if p.LatencyWeight <= 0 || p.AvailabilityWeight <= 0 {
+			return fmt.Errorf("pool.mode 'weighted' requires latency_weight>0 and availability_weight>0")
+		}
+	default:
+		return fmt.Errorf("unsupported pool.mode %q (use 'sequential', 'random', 'balance', or 'weighted')", p.Mode)
+	}
+	return nil
+}
+
+// ValidationError 配置业务校验失败。API 层据此映射 422（区别于 500 内部错误）。
+type ValidationError struct{ Msg string }
+
+func (e *ValidationError) Error() string { return e.Msg }
+
+// ValidateVirtualPoolConfig 校验单个虚拟池配置并填充默认值（strategy/address）。
+// weighted 策略要求 latency_weight>0 且 availability_weight>0。供配置加载与 API CRUD 共用。
+func ValidateVirtualPoolConfig(p *VirtualPoolConfig) error {
+	if p.Strategy == "" {
+		p.Strategy = "sequential"
+	}
+	switch p.Strategy {
+	case "sequential", "random", "balance", "weighted":
+	default:
+		return &ValidationError{Msg: fmt.Sprintf("invalid strategy %q (use 'sequential', 'random', 'balance', or 'weighted')", p.Strategy)}
+	}
+	if p.Strategy == "weighted" {
+		if p.LatencyWeight <= 0 || p.AvailabilityWeight <= 0 {
+			return &ValidationError{Msg: "strategy 'weighted' requires latency_weight>0 and availability_weight>0"}
+		}
+	}
+	if p.Address == "" {
+		p.Address = "0.0.0.0"
+	}
+	if p.MaxLatencyMs < 0 {
+		return &ValidationError{Msg: "max_latency_ms cannot be negative"}
+	}
+	return nil
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
@@ -60,6 +120,11 @@ type MultiPortConfig struct {
 	BasePort uint16 `yaml:"base_port"`
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+}
+
+// VirtualPoolSettings 虚拟池子系统全局设置。
+type VirtualPoolSettings struct {
+	BasePort uint16 `yaml:"base_port"` // 虚拟池端口分配起点（必填，无默认；新建池端口留空时从此起点按 max(已用)+1 分配）
 }
 
 // ManagementConfig controls the monitoring HTTP endpoint.
@@ -84,14 +149,30 @@ type SubscriptionRefreshConfig struct {
 // VirtualPoolConfig 定义虚拟池配置
 // 虚拟池允许用户通过正则表达式筛选节点，创建独立的负载均衡入口
 type VirtualPoolConfig struct {
-	Name         string `yaml:"name"`                    // 虚拟池名称（唯一标识）
-	Regular      string `yaml:"regular"`                 // 正则表达式，用于匹配节点名称
-	Address      string `yaml:"address"`                 // 监听地址
-	Port         uint16 `yaml:"port"`                    // 监听端口
-	Username     string `yaml:"username,omitempty"`      // 认证用户名（可选）
-	Password     string `yaml:"password,omitempty"`      // 认证密码（可选）
-	Strategy     string `yaml:"strategy,omitempty"`      // 负载均衡策略：sequential/random/balance，默认 sequential
-	MaxLatencyMs int    `yaml:"max_latency_ms,omitempty"` // 最大延迟阈值（毫秒），可选的额外过滤条件
+	ID           uint64   `yaml:"id" json:"id"`                                               // 稳定标识（bbolt sequence，CRUD 路由主键；name 可改）
+	Name         string   `yaml:"name" json:"name"`                                           // 虚拟池名称（唯一标识）
+	Regular      string   `yaml:"regular" json:"regular"`                                     // 正则表达式，用于匹配节点名称
+	Address      string   `yaml:"address" json:"address"`                                     // 监听地址
+	Port         uint16   `yaml:"port" json:"port"`                                           // 监听端口
+	Username     string   `yaml:"username,omitempty" json:"username,omitempty"`               // 认证用户名（可选）
+	Password     string   `yaml:"password,omitempty" json:"password,omitempty"`               // 认证密码（可选）
+	Strategy     string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`               // 负载均衡策略：sequential/random/balance/weighted，默认 sequential
+	MaxLatencyMs int      `yaml:"max_latency_ms,omitempty" json:"max_latency_ms,omitempty"`   // 最大延迟阈值（毫秒），可选的额外过滤条件
+	LatencyWeight      float64 `yaml:"latency_weight,omitempty" json:"latency_weight,omitempty"`           // weighted 策略：延迟权重（>0，与 availability_weight 相对比例，内部归一化）
+	AvailabilityWeight float64 `yaml:"availability_weight,omitempty" json:"availability_weight,omitempty"` // weighted 策略：可用率权重（>0）
+	CountryCodes         []string `yaml:"country_codes,omitempty" json:"country_codes,omitempty"`                 // 国家码包含过滤（可选，与 regular 并存）
+	ExcludedCountryCodes []string `yaml:"excluded_country_codes,omitempty" json:"excluded_country_codes,omitempty"` // 国家码排除过滤（可选，命中则跳过该节点）
+}
+
+// GeoIPConfig 本地 MaxMind GeoLite2-ASN 查询配置（可选）。
+// 配置后，节点探测到出口 IP 会回填 ASN 与组织名；不配置则相关字段留空。
+// 配置 license_key + account_id 后启用自动更新：缺库下载、有库按 If-Modified-Since 周期更新。
+type GeoIPConfig struct {
+	ASNDatabase    string        `yaml:"asn_database"`    // GeoLite2-ASN.mmdb 路径，空=禁用 ASN 查询
+	AccountID      string        `yaml:"account_id"`      // MaxMind Account ID（自动更新用，Basic Auth 用户名）
+	LicenseKey     string        `yaml:"license_key"`     // MaxMind License Key（自动更新用，Basic Auth 密码）
+	EditionID      string        `yaml:"edition_id"`      // 数据库 edition，默认 GeoLite2-ASN
+	UpdateInterval time.Duration `yaml:"update_interval"` // 自动更新检查间隔，默认 24h（MaxMind 每周二更新）
 }
 
 // NodeSource indicates where a node configuration originated from.
@@ -101,22 +182,46 @@ const (
 	NodeSourceInline       NodeSource = "inline"       // Defined directly in config.yaml nodes array
 	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
 	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
+	NodeSourceManual       NodeSource = "manual"       // Added via WebUI/API
 )
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	Name     string     `yaml:"name" json:"name"`
-	URI      string     `yaml:"uri" json:"uri"`
-	Port     uint16     `yaml:"port,omitempty" json:"port,omitempty"`
-	Username string     `yaml:"username,omitempty" json:"username,omitempty"`
-	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
-	Source   NodeSource `yaml:"-" json:"source,omitempty"` // Runtime only, not persisted
+	Name           string     `yaml:"name" json:"name"`
+	URI            string     `yaml:"uri" json:"uri"`
+	Port           uint16     `yaml:"port,omitempty" json:"port,omitempty"`
+	Username       string     `yaml:"username,omitempty" json:"username,omitempty"`
+	Password       string     `yaml:"password,omitempty" json:"password,omitempty"`
+	Source         NodeSource `yaml:"source,omitempty" json:"source,omitempty"`                 // 持久化来源：inline/nodes_file/subscription/manual
+	StableID       string     `yaml:"stable_id,omitempty" json:"stable_id,omitempty"`          // 跨刷新稳定主键（data-model §1.4）
+	SubscriptionID uint64     `yaml:"subscription_id,omitempty" json:"subscription_id,omitempty"` // source=subscription 时关联 Subscription.id
+	DuplicateOf    string     `yaml:"duplicate_of,omitempty" json:"duplicate_of,omitempty"`    // 去重标记，指向留存节点 stable_id
+	CountryCode    string     `yaml:"country_code,omitempty" json:"country_code,omitempty"`    // 冗余缓存（NodeProbe 派生），列表快速展示
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.
 // This is used to preserve port assignments across reloads.
 func (n *NodeConfig) NodeKey() string {
 	return n.URI
+}
+
+// StableID 计算节点的跨刷新稳定主键（data-model §1.4，ADR-0010）。
+//   非订阅节点：hex(sha256(source + ":" + uri))
+//   订阅节点：  hex(sha256("subscription:" + sub_id + ":" + uri))
+// 同订阅刷新 URI 不变 → stable_id 不变，关联保留；URI 变视为新节点；跨订阅同节点靠 exit_ip 去重。
+func StableID(source NodeSource, subID uint64, uri string) string {
+	h := sha256.New()
+	if source == NodeSourceSubscription {
+		io.WriteString(h, "subscription:")
+		io.WriteString(h, strconv.FormatUint(subID, 10))
+		io.WriteString(h, ":")
+		io.WriteString(h, uri)
+	} else {
+		io.WriteString(h, string(source))
+		io.WriteString(h, ":")
+		io.WriteString(h, uri)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -130,11 +235,16 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 	cfg.filePath = path
+	cfg.saveMu = &sync.Mutex{}
 
 	// Resolve nodes_file path relative to config file directory
 	if cfg.NodesFile != "" && !filepath.IsAbs(cfg.NodesFile) {
 		configDir := filepath.Dir(path)
 		cfg.NodesFile = filepath.Join(configDir, cfg.NodesFile)
+	}
+	// Resolve geoip.asn_database path relative to config file directory
+	if cfg.GeoIP.ASNDatabase != "" && !filepath.IsAbs(cfg.GeoIP.ASNDatabase) {
+		cfg.GeoIP.ASNDatabase = filepath.Join(filepath.Dir(path), cfg.GeoIP.ASNDatabase)
 	}
 
 	if err := cfg.normalize(); err != nil {
@@ -156,14 +266,17 @@ func (c *Config) normalize() error {
 	default:
 		return fmt.Errorf("unsupported mode %q (use 'pool', 'multi-port', or 'hybrid')", c.Mode)
 	}
-	if c.Listener.Address == "" {
-		c.Listener.Address = "0.0.0.0"
+	if c.Pool.Address == "" {
+		c.Pool.Address = "0.0.0.0"
 	}
-	if c.Listener.Port == 0 {
-		c.Listener.Port = 2323
+	if c.Pool.Port == 0 {
+		c.Pool.Port = 2323
 	}
 	if c.Pool.Mode == "" {
 		c.Pool.Mode = "sequential"
+	}
+	if err := validatePoolMode(c.Pool); err != nil {
+		return err
 	}
 	if c.Pool.FailureThreshold <= 0 {
 		c.Pool.FailureThreshold = 3
@@ -186,6 +299,10 @@ func (c *Config) normalize() error {
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
+	}
+	if c.AlertEnabled == nil {
+		defaultAlert := true
+		c.AlertEnabled = &defaultAlert
 	}
 
 	// Subscription refresh defaults
@@ -292,6 +409,11 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("node %d is missing uri", idx)
 		}
 
+		// 回填稳定 ID（source 已在加载阶段确定；订阅节点 subscription_id 阶段2 接 bbolt 后修正）
+		if c.Nodes[idx].StableID == "" {
+			c.Nodes[idx].StableID = StableID(c.Nodes[idx].Source, c.Nodes[idx].SubscriptionID, c.Nodes[idx].URI)
+		}
+
 		// Auto-extract name from URI fragment (#name) if not provided
 		if c.Nodes[idx].Name == "" {
 			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
@@ -341,7 +463,7 @@ func (c *Config) normalize() error {
 
 	// Auto-fix port conflicts in hybrid mode (pool port vs multi-port)
 	if c.Mode == "hybrid" {
-		poolPort := c.Listener.Port
+		poolPort := c.Pool.Port
 		usedPorts := make(map[uint16]bool)
 		usedPorts[poolPort] = true
 		for idx := range c.Nodes {
@@ -398,14 +520,17 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	default:
 		return fmt.Errorf("unsupported mode %q (use 'pool', 'multi-port', or 'hybrid')", c.Mode)
 	}
-	if c.Listener.Address == "" {
-		c.Listener.Address = "0.0.0.0"
+	if c.Pool.Address == "" {
+		c.Pool.Address = "0.0.0.0"
 	}
-	if c.Listener.Port == 0 {
-		c.Listener.Port = 2323
+	if c.Pool.Port == 0 {
+		c.Pool.Port = 2323
 	}
 	if c.Pool.Mode == "" {
 		c.Pool.Mode = "sequential"
+	}
+	if err := validatePoolMode(c.Pool); err != nil {
+		return err
 	}
 	if c.Pool.FailureThreshold <= 0 {
 		c.Pool.FailureThreshold = 3
@@ -428,6 +553,10 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
+	}
+	if c.AlertEnabled == nil {
+		defaultAlert := true
+		c.AlertEnabled = &defaultAlert
 	}
 	if c.SubscriptionRefresh.Interval <= 0 {
 		c.SubscriptionRefresh.Interval = 1 * time.Hour
@@ -452,7 +581,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	// Build set of ports already assigned from portMap
 	usedPorts := make(map[uint16]bool)
 	if c.Mode == "hybrid" {
-		usedPorts[c.Listener.Port] = true
+		usedPorts[c.Pool.Port] = true
 	}
 
 	// First pass: assign ports from portMap for existing nodes
@@ -461,6 +590,11 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
 		if c.Nodes[idx].URI == "" {
 			return fmt.Errorf("node %d is missing uri", idx)
+		}
+
+		// 回填稳定 ID（source 已确定）
+		if c.Nodes[idx].StableID == "" {
+			c.Nodes[idx].StableID = StableID(c.Nodes[idx].Source, c.Nodes[idx].SubscriptionID, c.Nodes[idx].URI)
 		}
 
 		// Extract name from URI fragment if not provided
@@ -535,6 +669,14 @@ func (c *Config) ManagementEnabled() bool {
 	return *c.Management.Enabled
 }
 
+// AlertsEnabled reports whether the security alert (empty-password) check is active. Defaults to true.
+func (c *Config) AlertsEnabled() bool {
+	if c.AlertEnabled == nil {
+		return true
+	}
+	return *c.AlertEnabled
+}
+
 // parseSubscriptionEntry 解析订阅条目，支持 "订阅名字:URL" 或 "URL" 格式
 // 返回订阅名字和URL，如果没有订阅名字则返回空字符串
 func parseSubscriptionEntry(entry string) (name, url string) {
@@ -607,11 +749,13 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 	content := string(body)
 
 	// Try to detect and parse different formats
-	return parseSubscriptionContent(content)
+	return ParseSubscriptionContent(content)
 }
 
-// parseSubscriptionContent tries to parse subscription content in various formats
-func parseSubscriptionContent(content string) ([]NodeConfig, error) {
+// ParseSubscriptionContent tries to parse subscription content in various formats
+// (base64 / plain text / Clash YAML). Exported so the subscription refresher reuses
+// the full parser (incl. Clash YAML) instead of a plain-text/base64-only fallback.
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
@@ -956,10 +1100,11 @@ func writeNodesToFile(path string, nodes []NodeConfig) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
-// SaveNodes persists nodes to their appropriate locations based on source.
-// - subscription/nodes_file nodes → nodes.txt (or configured nodes_file)
-// - inline nodes → config.yaml nodes array
-// Config.yaml structure (subscriptions, nodes_file) is preserved.
+// SaveNodes persists inline/manual nodes to config.yaml.
+// nodes.txt 不再整体覆写（修复 D1：避免订阅刷新吞掉手动节点）。
+//   inline/manual → config.yaml nodes[]
+//   subscription  → bbolt（阶段2 实体化），运行时由订阅刷新产生，不入文件
+//   nodes_file    → 一次性导入源，不回写
 func (c *Config) SaveNodes() error {
 	if c == nil {
 		return errors.New("config is nil")
@@ -968,65 +1113,49 @@ func (c *Config) SaveNodes() error {
 		return errors.New("config file path is unknown")
 	}
 
-	// Separate nodes by source
-	var inlineNodes []NodeConfig
-	var fileNodes []NodeConfig
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 
+	var persistNodes []NodeConfig
 	for _, node := range c.Nodes {
-		// Create a clean copy without runtime fields for saving
-		cleanNode := NodeConfig{
-			Name:     node.Name,
-			URI:      node.URI,
-			Port:     node.Port,
-			Username: node.Username,
-			Password: node.Password,
-		}
 		switch node.Source {
-		case NodeSourceInline:
-			inlineNodes = append(inlineNodes, cleanNode)
-		case NodeSourceFile, NodeSourceSubscription:
-			fileNodes = append(fileNodes, cleanNode)
-		default:
-			// Default to file nodes for unknown source
-			fileNodes = append(fileNodes, cleanNode)
+		case NodeSourceInline, NodeSourceManual:
+			persistNodes = append(persistNodes, NodeConfig{
+				Name:           node.Name,
+				URI:            node.URI,
+				Port:           node.Port,
+				Username:       node.Username,
+				Password:       node.Password,
+				Source:         node.Source,
+				StableID:       node.StableID,
+				SubscriptionID: node.SubscriptionID,
+				DuplicateOf:    node.DuplicateOf,
+				CountryCode:    node.CountryCode,
+			})
 		}
 	}
 
-	// Write file-based nodes to nodes.txt
-	if len(fileNodes) > 0 || c.NodesFile != "" {
-		nodesFilePath := c.NodesFile
-		if nodesFilePath == "" {
-			nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-		}
-		if err := writeNodesToFile(nodesFilePath, fileNodes); err != nil {
-			return fmt.Errorf("write nodes file %q: %w", nodesFilePath, err)
-		}
+	// 读原 config 保留结构，只更新 nodes[]
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
 	}
-
-	// Only update config.yaml if there are inline nodes to save
-	// and preserve the original config structure
-	if len(inlineNodes) > 0 {
-		// Read original config to preserve structure
-		data, err := os.ReadFile(c.filePath)
-		if err != nil {
-			return fmt.Errorf("read config: %w", err)
-		}
-		var saveCfg Config
-		if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-			return fmt.Errorf("decode config: %w", err)
-		}
-		// Update only the inline nodes
-		saveCfg.Nodes = inlineNodes
-
-		newData, err := yaml.Marshal(&saveCfg)
-		if err != nil {
-			return fmt.Errorf("encode config: %w", err)
-		}
-		if err := os.WriteFile(c.filePath, newData, 0o644); err != nil {
-			return fmt.Errorf("write config: %w", err)
-		}
+	var saveCfg Config
+	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
 	}
+	if len(persistNodes) == 0 && len(saveCfg.Nodes) == 0 {
+		return nil // 无 inline/manual 节点且原配置也无，无需写
+	}
+	saveCfg.Nodes = persistNodes
 
+	newData, err := yaml.Marshal(&saveCfg)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := os.WriteFile(c.filePath, newData, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
 	return nil
 }
 
@@ -1036,7 +1165,22 @@ func (c *Config) Save() error {
 	return c.SaveNodes()
 }
 
-// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify)
+// EnsureCredentialKey 确保凭证加密密钥存在；为空则生成 32 字节随机密钥并持久化到 config.yaml。
+// 密钥存配置文件、与 db 文件分离（db 只存 AES 密文），故 db 单独泄露时无法解密凭证。
+// 密钥纯服务端使用，前端/浏览器永不接触。
+func (c *Config) EnsureCredentialKey() error {
+	if c.CredentialKey != "" {
+		return nil
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return fmt.Errorf("generate credential key: %w", err)
+	}
+	c.CredentialKey = hex.EncodeToString(key)
+	return c.SaveSettings()
+}
+
+// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify, credential_key)
 // without touching nodes.txt. Use this for settings API updates.
 func (c *Config) SaveSettings() error {
 	if c == nil {
@@ -1045,6 +1189,9 @@ func (c *Config) SaveSettings() error {
 	if c.filePath == "" {
 		return errors.New("config file path is unknown")
 	}
+
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 
 	data, err := os.ReadFile(c.filePath)
 	if err != nil {
@@ -1058,6 +1205,8 @@ func (c *Config) SaveSettings() error {
 	saveCfg.ExternalIP = c.ExternalIP
 	saveCfg.Management.ProbeTarget = c.Management.ProbeTarget
 	saveCfg.SkipCertVerify = c.SkipCertVerify
+	saveCfg.AlertEnabled = c.AlertEnabled
+	saveCfg.CredentialKey = c.CredentialKey
 
 	newData, err := yaml.Marshal(&saveCfg)
 	if err != nil {
@@ -1067,6 +1216,166 @@ func (c *Config) SaveSettings() error {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+// SaveVirtualPools 持久化 virtual_pools 段到 config.yaml（读原文件保留其他段，仅替换 virtual_pools）。
+// 供虚拟池 API CRUD 回写，使页面创建/修改的虚拟池落盘可被用户二次编辑。
+func (c *Config) SaveVirtualPools() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var saveCfg Config
+	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	saveCfg.VirtualPools = c.VirtualPools
+
+	newData, err := yaml.Marshal(&saveCfg)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := os.WriteFile(c.filePath, newData, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
+// SaveSubscriptions 持久化 subscriptions 段（[]string "name:url"）到 config.yaml。
+// 订阅运行时状态（刷新状态/节点数/时间戳）留在 bbolt，不入 yaml；此方法只写用户可编辑的订阅链接清单。
+func (c *Config) SaveSubscriptions() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	return c.saveSubscriptionsLocked()
+}
+
+// saveSubscriptionsLocked 持 saveMu 时写 subscriptions 段（调用方持锁）。
+func (c *Config) saveSubscriptionsLocked() error {
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var saveCfg Config
+	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	saveCfg.Subscriptions = c.Subscriptions
+
+	newData, err := yaml.Marshal(&saveCfg)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := os.WriteFile(c.filePath, newData, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
+// SubscriptionsList 返回订阅列表的快照拷贝（持锁，供并发安全读取）。
+func (c *Config) SubscriptionsList() []string {
+	if c == nil {
+		return nil
+	}
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	out := make([]string, len(c.Subscriptions))
+	copy(out, c.Subscriptions)
+	return out
+}
+
+// AddSubscription 追加订阅到 yaml（name:url），按 url 幂等（已存在则更新 name）。持 saveMu 原子写。
+// 供订阅 CRUD 的 yaml-first 提交：先落 yaml（权威源），再写 bbolt；bbolt 失败时 yaml 领先，
+// 下次启动 SyncSubscriptions 会按 yaml 补建 bbolt，崩溃安全。
+func (c *Config) AddSubscription(name, url string) error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+	entry := formatSubscriptionEntry(name, url)
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	if idx := c.findSubscriptionIndexLocked(url); idx >= 0 {
+		c.Subscriptions[idx] = entry // 幂等：同 url 更新 name
+	} else {
+		c.Subscriptions = append(c.Subscriptions, entry)
+	}
+	return c.saveSubscriptionsLocked()
+}
+
+// RemoveSubscription 按 url 移除订阅条目（未找到视为已删除，幂等）。持 saveMu 原子写。
+func (c *Config) RemoveSubscription(url string) error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	idx := c.findSubscriptionIndexLocked(url)
+	if idx < 0 {
+		return nil
+	}
+	c.Subscriptions = append(c.Subscriptions[:idx], c.Subscriptions[idx+1:]...)
+	return c.saveSubscriptionsLocked()
+}
+
+// UpdateSubscriptionEntry 把 oldURL 对应条目改为新 name:url；oldURL 不存在则追加。持 saveMu 原子写。
+func (c *Config) UpdateSubscriptionEntry(oldURL, name, url string) error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+	entry := formatSubscriptionEntry(name, url)
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+	if idx := c.findSubscriptionIndexLocked(oldURL); idx >= 0 {
+		c.Subscriptions[idx] = entry
+	} else {
+		c.Subscriptions = append(c.Subscriptions, entry)
+	}
+	return c.saveSubscriptionsLocked()
+}
+
+// findSubscriptionIndexLocked 按 url 查找订阅条目索引（调用方持 saveMu）。
+func (c *Config) findSubscriptionIndexLocked(targetURL string) int {
+	for i, e := range c.Subscriptions {
+		_, u := parseSubscriptionEntry(e)
+		if u != "" && u == targetURL {
+			return i
+		}
+	}
+	return -1
+}
+
+// formatSubscriptionEntry 编码 "name:url"（无 name 则裸 url），与 parseSubscriptionEntry 互逆。
+func formatSubscriptionEntry(name, url string) string {
+	name = strings.TrimSpace(name)
+	url = strings.TrimSpace(url)
+	if name == "" {
+		return url
+	}
+	return name + ":" + url
 }
 
 // isPortAvailable checks if a port is available for binding.
@@ -1092,7 +1401,7 @@ func (c *Config) validateVirtualPools() error {
 
 	// 添加 listener 端口（pool/hybrid 模式）
 	if c.Mode == "pool" || c.Mode == "hybrid" {
-		usedPorts[c.Listener.Port] = "listener"
+		usedPorts[c.Pool.Port] = "listener"
 	}
 
 	// 添加 management 端口
@@ -1116,6 +1425,15 @@ func (c *Config) validateVirtualPools() error {
 		}
 	}
 
+	// 虚拟池端口自动分配起点：有留空端口的池时必填 virtual_pool.base_port
+	if c.VirtualPool.BasePort == 0 {
+		for _, p := range c.VirtualPools {
+			if p.Port == 0 {
+				return fmt.Errorf("virtual_pool.base_port is required (virtual pool %q has no explicit port)", p.Name)
+			}
+		}
+	}
+
 	// 收集虚拟池名称用于唯一性检查
 	poolNames := make(map[string]bool)
 
@@ -1131,14 +1449,11 @@ func (c *Config) validateVirtualPools() error {
 		}
 		poolNames[pool.Name] = true
 
-		// 验证正则表达式非空
-		if pool.Regular == "" {
-			return fmt.Errorf("virtual_pools[%d] %q: regular expression is required", idx, pool.Name)
-		}
-
-		// 验证正则表达式语法（使用 regexp2 支持零宽断言）
-		if _, err := regexp2.Compile(pool.Regular, regexp2.RE2); err != nil {
-			return fmt.Errorf("virtual_pools[%d] %q: invalid regular expression %q: %w", idx, pool.Name, pool.Regular, err)
+		// 正则可选：为空表示不按节点名过滤（仅按国家码/延迟）；非空时校验语法
+		if pool.Regular != "" {
+			if _, err := regexp2.Compile(pool.Regular, regexp2.RE2); err != nil {
+				return fmt.Errorf("virtual_pools[%d] %q: invalid regular expression %q: %w", idx, pool.Name, pool.Regular, err)
+			}
 		}
 
 		// 验证地址非空
@@ -1146,27 +1461,31 @@ func (c *Config) validateVirtualPools() error {
 			return fmt.Errorf("virtual_pools[%d] %q: address is required", idx, pool.Name)
 		}
 
-		// 验证端口范围
-		if pool.Port == 0 {
-			return fmt.Errorf("virtual_pools[%d] %q: port is required", idx, pool.Name)
-		}
+		// 端口：留空(0) 表示运行时自动分配（需 virtual_pool.base_port）；非空时校验范围+冲突
 		if pool.Port > 65535 {
 			return fmt.Errorf("virtual_pools[%d] %q: port %d is out of range (1-65535)", idx, pool.Name, pool.Port)
 		}
-
-		// 验证端口冲突
-		if owner, exists := usedPorts[pool.Port]; exists {
-			return fmt.Errorf("virtual_pools[%d] %q: port %d conflicts with %s", idx, pool.Name, pool.Port, owner)
+		if pool.Port != 0 {
+			if owner, exists := usedPorts[pool.Port]; exists {
+				return fmt.Errorf("virtual_pools[%d] %q: port %d conflicts with %s", idx, pool.Name, pool.Port, owner)
+			}
+			usedPorts[pool.Port] = fmt.Sprintf("virtual_pool:%s", pool.Name)
 		}
-		usedPorts[pool.Port] = fmt.Sprintf("virtual_pool:%s", pool.Name)
 
 		// 验证负载均衡策略
 		if pool.Strategy != "" {
 			switch pool.Strategy {
-			case "sequential", "random", "balance":
+			case "sequential", "random", "balance", "weighted":
 				// 有效策略
 			default:
-				return fmt.Errorf("virtual_pools[%d] %q: invalid strategy %q (use 'sequential', 'random', or 'balance')", idx, pool.Name, pool.Strategy)
+				return fmt.Errorf("virtual_pools[%d] %q: invalid strategy %q (use 'sequential', 'random', 'balance', or 'weighted')", idx, pool.Name, pool.Strategy)
+			}
+		}
+
+		// weighted 策略必须显式提供两个权重（均 >0）；其余策略忽略权重
+		if c.VirtualPools[idx].Strategy == "weighted" {
+			if pool.LatencyWeight <= 0 || pool.AvailabilityWeight <= 0 {
+				return fmt.Errorf("virtual_pools[%d] %q: strategy 'weighted' requires latency_weight>0 and availability_weight>0", idx, pool.Name)
 			}
 		}
 

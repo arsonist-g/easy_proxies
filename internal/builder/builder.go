@@ -52,9 +52,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
-			Name: node.Name,
-			URI:  node.URI,
-			Mode: cfg.Mode,
+			Name:     node.Name,
+			URI:      node.URI,
+			StableID: node.StableID,
+			Mode:     cfg.Mode,
 		}
 		// For multi-port and hybrid modes, use per-node port and multi-port credentials
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
@@ -63,10 +64,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 			meta.Username = cfg.MultiPort.Username
 			meta.Password = cfg.MultiPort.Password
 		} else {
-			meta.ListenAddress = cfg.Listener.Address
-			meta.Port = cfg.Listener.Port
-			meta.Username = cfg.Listener.Username
-			meta.Password = cfg.Listener.Password
+			meta.ListenAddress = cfg.Pool.Address
+			meta.Port = cfg.Pool.Port
+			meta.Username = cfg.Pool.Username
+			meta.Password = cfg.Pool.Password
 		}
 		metadata[tag] = meta
 	}
@@ -113,6 +114,8 @@ func Build(cfg *config.Config) (option.Options, error) {
 			FailureThreshold:  cfg.Pool.FailureThreshold,
 			BlacklistDuration: cfg.Pool.BlacklistDuration,
 			Metadata:          metadata,
+			LatencyWeight:      cfg.Pool.LatencyWeight,
+			AvailabilityWeight: cfg.Pool.AvailabilityWeight,
 		}
 		outbounds = append(outbounds, option.Outbound{
 			Type:    poolout.Type,
@@ -195,20 +198,20 @@ func Build(cfg *config.Config) (option.Options, error) {
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
-	listenAddr, err := parseAddr(cfg.Listener.Address)
+	listenAddr, err := parseAddr(cfg.Pool.Address)
 	if err != nil {
 		return option.Inbound{}, fmt.Errorf("parse listener address: %w", err)
 	}
 	inboundOptions := &option.HTTPMixedInboundOptions{
 		ListenOptions: option.ListenOptions{
 			Listen:     listenAddr,
-			ListenPort: cfg.Listener.Port,
+			ListenPort: cfg.Pool.Port,
 		},
 	}
-	if cfg.Listener.Username != "" {
+	if cfg.Pool.Username != "" {
 		inboundOptions.Users = []auth.User{{
-			Username: cfg.Listener.Username,
-			Password: cfg.Listener.Password,
+			Username: cfg.Pool.Username,
+			Password: cfg.Pool.Password,
 		}}
 	}
 	inbound := option.Inbound{
@@ -258,6 +261,16 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+// ValidateNodeURI 解析节点 URI，验证协议是否支持 + 必要字段格式是否完整。
+// 纯解析（URI → outbound 配置对象），不创建/触碰 sing-box 运行实例，不查连通性。
+// 供添加节点前置校验：解析失败直接拒绝，节点不进配置、不触发 reload，不影响运行中的代理。
+// 与 Clash 添加订阅行为一致——只验证协议/格式，不验证节点可达性。
+// 当前支持协议：vless / hysteria2 / ss(shadowsocks) / trojan / vmess。
+func ValidateNodeURI(rawURI string, skipCertVerify bool) error {
+	_, err := buildNodeOutbound("validate", rawURI, skipCertVerify)
+	return err
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {
@@ -799,10 +812,10 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes
 		var auth string
-		if cfg.Listener.Username != "" {
-			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
+		if cfg.Pool.Username != "" {
+			auth = fmt.Sprintf("%s:%s@", cfg.Pool.Username, cfg.Pool.Password)
 		}
-		proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
+		proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Pool.Address, cfg.Pool.Port)
 		logger.Print("🌐 Pool Entry Point:")
 		logger.Print(fmt.Sprintf("   %s", proxyURL))
 		logger.Print("")

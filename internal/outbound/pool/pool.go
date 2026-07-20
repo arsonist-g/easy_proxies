@@ -1,9 +1,7 @@
 package pool
 
 import (
-	"bufio"
 	"context"
-	"fmt"
 	"math/rand"
 	"net"
 	"strings"
@@ -11,6 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/availability"
+	"easy_proxies/internal/countryprobe"
+	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/monitor"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -32,6 +33,7 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+	modeWeighted   = "weighted" // 加权随机：按延迟+可用率综合得分抽取（需 LatencyWeight/AvailabilityWeight）
 )
 
 // Options controls pool outbound behaviour.
@@ -41,12 +43,15 @@ type Options struct {
 	FailureThreshold  int
 	BlacklistDuration time.Duration
 	Metadata          map[string]MemberMeta
+	LatencyWeight      float64 // Mode=weighted：延迟权重（>0，内部归一化）
+	AvailabilityWeight float64 // Mode=weighted：可用率权重（>0）
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
 type MemberMeta struct {
 	Name          string
 	URI           string
+	StableID      string // 跨刷新稳定主键
 	Mode          string
 	ListenAddress string
 	Port          uint16
@@ -59,11 +64,23 @@ func Register(registry *outbound.Registry) {
 	outbound.Register[Options](registry, Type, newPool)
 }
 
+// 探测模式（分层探测，省流量）：CF 通过后常规健康检查降级为 apple:80 轻量探测。
+// 节点的 IP/国家/ASN 只在更新时变化，CF 一次拿到后缓存，常规检查只需测"还活不活"。
+const (
+	probeModeCF    int32 = 0 // CF trace：拿可用性+延迟+出口IP+国家+ASN（新节点/Reload/CF 未通过）
+	probeModeApple int32 = 1 // apple:80 轻量连通性（CF 已通过后常规健康检查，省 ~88% 流量）
+	appleEndpoint        = "www.apple.com:80"
+	appleHost            = "www.apple.com"
+)
+
 type memberState struct {
-	outbound adapter.Outbound
-	tag      string
-	entry    *monitor.EntryHandle
-	shared   *sharedMemberState
+	outbound     adapter.Outbound
+	tag          string
+	stableID     string // 跨刷新稳定主键（可用率/去重 key）
+	entry        *monitor.EntryHandle
+	shared       *sharedMemberState
+	probeMode    atomic.Int32  // 探测模式：见 probeMode* 常量；CF 成功后 Store(probeModeApple)
+	lastLatencyMs atomic.Int64 // 最近探测延迟（毫秒），weighted 选择用；探测成功路径写入，选择时无锁读
 }
 
 type poolOutbound struct {
@@ -73,12 +90,16 @@ type poolOutbound struct {
 	manager        adapter.OutboundManager
 	options        Options
 	mode           string
+	wLat           float64 // weighted：延迟权重（归一化前的原始值，WeightedScore 内部归一化）
+	wAvail         float64 // weighted：可用率权重
 	members        []*memberState
 	mu             sync.Mutex
 	rrCounter      atomic.Uint32
 	rng            *rand.Rand
 	rngMu          sync.Mutex // protects rng for random mode
 	monitor        *monitor.Manager
+	tracker        *availability.Tracker   // 可用率统计（转发/探测计数），可空
+	prober         *countryprobe.Prober    // 国家探测（cdn-cgi/trace），无状态
 	candidatesPool sync.Pool
 }
 
@@ -100,6 +121,8 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 		manager: manager,
 		options: normalized,
 		mode:    normalized.Mode,
+		wLat:    normalized.LatencyWeight,
+		wAvail:  normalized.AvailabilityWeight,
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		monitor: monitorMgr,
 		candidatesPool: sync.Pool{
@@ -107,6 +130,12 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 				return make([]*memberState, 0, memberCount)
 			},
 		},
+	}
+
+	// 国家探测器（无状态）与可用率统计器（来自 monitor.Manager）
+	p.prober = countryprobe.New()
+	if monitorMgr != nil {
+		p.tracker = monitorMgr.Tracker()
 	}
 
 	// Register nodes immediately if monitor is available
@@ -119,6 +148,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 			meta := normalized.Metadata[memberTag]
 			info := monitor.NodeInfo{
 				Tag:           memberTag,
+				StableID:      meta.StableID,
 				Name:          meta.Name,
 				URI:           meta.URI,
 				Mode:          meta.Mode,
@@ -163,6 +193,13 @@ func normalizeOptions(options Options) Options {
 		options.Mode = modeRandom
 	case modeBalance:
 		options.Mode = modeBalance
+	case modeWeighted:
+		// weighted 需两个权重 >0；缺失则降级为 sequential（正常路径由 config 校验保证不触发）
+		if options.LatencyWeight <= 0 || options.AvailabilityWeight <= 0 {
+			options.Mode = modeSequential
+		} else {
+			options.Mode = modeWeighted
+		}
 	default:
 		options.Mode = modeSequential
 	}
@@ -202,18 +239,20 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		// Acquire shared state (creates if not exists, reuses if already created)
 		state := acquireSharedState(tag)
 
+		meta := p.options.Metadata[tag]
 		member := &memberState{
 			outbound: detour,
 			tag:      tag,
+			stableID: meta.StableID,
 			shared:   state,
 			entry:    state.entryHandle(),
 		}
 
 		// Connect to existing monitor entry if available
 		if p.monitor != nil {
-			meta := p.options.Metadata[tag]
 			info := monitor.NodeInfo{
 				Tag:           tag,
+				StableID:      meta.StableID,
 				Name:          meta.Name,
 				URI:           meta.URI,
 				Mode:          meta.Mode,
@@ -240,12 +279,11 @@ func (p *poolOutbound) initializeMembersLocked() error {
 	return nil
 }
 
-// probeAllMembersOnStartup performs initial health checks on all members
+// probeAllMembersOnStartup performs initial health checks on all members.
+// 统一走 Cloudflare cdn-cgi/trace：一次取得 可用性+延迟+出口IP+国家+ASN。
 func (p *poolOutbound) probeAllMembersOnStartup() {
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		p.logger.Warn("probe target not configured, skipping initial health check")
-		// 没有配置探测目标时，标记所有节点为可用
+	if p.prober == nil {
+		p.logger.Warn("prober not initialized, skipping initial health check")
 		p.mu.Lock()
 		for _, member := range p.members {
 			if member.entry != nil {
@@ -256,7 +294,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		return
 	}
 
-	p.logger.Info("starting initial health check for all nodes")
+	p.logger.Info("starting initial health check (Cloudflare cdn-cgi/trace) for all nodes")
 
 	p.mu.Lock()
 	members := make([]*memberState, len(p.members))
@@ -267,49 +305,24 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 	failedCount := 0
 
 	for _, member := range members {
-		// Create a timeout context for each probe
 		ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
-
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+		latency, err := p.probeOnce(ctx, member)
+		cancel()
 
 		if err != nil {
 			p.logger.Warn("initial probe failed for ", member.tag, ": ", err)
 			failedCount++
 			if member.entry != nil {
-				member.entry.RecordFailure(err)
-				member.entry.MarkInitialCheckDone(false) // 标记为不可用
-			}
-			cancel()
-			continue
-		}
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		conn.Close()
-
-		if err != nil {
-			p.logger.Warn("initial HTTP probe failed for ", member.tag, ": ", err)
-			failedCount++
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
 				member.entry.MarkInitialCheckDone(false)
 			}
-			cancel()
 			continue
 		}
 
-		// Total latency = dial + HTTP probe
-		latency := time.Since(start)
-		latencyMs := latency.Milliseconds()
-		p.logger.Info("initial probe success for ", member.tag, ", latency: ", latencyMs, "ms")
 		availableCount++
 		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(latency)
 			member.entry.MarkInitialCheckDone(true)
 		}
-
-		cancel()
+		p.logger.Info("initial probe success for ", member.tag, ", latency: ", latency.Milliseconds(), "ms")
 	}
 
 	p.logger.Info("initial health check completed: ", availableCount, " available, ", failedCount, " failed")
@@ -436,6 +449,24 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 			}
 		}
 		return selected
+	case modeWeighted:
+		// 加权随机：按延迟+可用率综合得分抽取。可用率一次取全量（Tracker.SnapshotAll，
+		// 单次 RLock），延迟走 member.lastLatencyMs（atomic 无锁读）。
+		if p.monitor == nil || p.tracker == nil || p.wLat <= 0 || p.wAvail <= 0 {
+			// 监控不可用或权重缺失：降级顺序轮询，保证可用
+			idx := int(p.rrCounter.Add(1)-1) % len(candidates)
+			return candidates[idx]
+		}
+		rates := p.tracker.SnapshotAll()
+		scores := make([]float64, len(candidates))
+		for i, m := range candidates {
+			av := rates[m.stableID]
+			scores[i] = monitor.WeightedScore(m.lastLatencyMs.Load(), av.Rate, av.Total, p.wLat, p.wAvail)
+		}
+		p.rngMu.Lock()
+		idx := monitor.PickWeighted(scores, p.rng)
+		p.rngMu.Unlock()
+		return candidates[idx]
 	default:
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
 		return candidates[idx]
@@ -445,20 +476,138 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 	if member.shared == nil {
 		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
-		return
-	}
-	failures, blacklisted, _ := member.shared.recordFailure(cause, p.options.FailureThreshold, p.options.BlacklistDuration)
-	if blacklisted {
-		p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
 	} else {
-		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
+		failures, blacklisted, _ := member.shared.recordFailure(cause, p.options.FailureThreshold, p.options.BlacklistDuration)
+		if blacklisted {
+			p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
+		} else {
+			p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
+		}
 	}
+	p.recordCall(member, false)
 }
 
 func (p *poolOutbound) recordSuccess(member *memberState) {
 	if member.shared != nil {
 		member.shared.recordSuccess()
 	}
+	p.recordCall(member, true)
+}
+
+// recordCall 记录一次真实转发调用结果到可用率统计（call 路，无锁 atomic）。
+func (p *poolOutbound) recordCall(member *memberState, success bool) {
+	if p.tracker != nil && member.stableID != "" {
+		p.tracker.RecordCall(member.stableID, success)
+	}
+}
+
+// recordProbe 记录一次健康探测结果到可用率统计（probe 路）。
+func (p *poolOutbound) recordProbe(member *memberState, success bool) {
+	if p.tracker != nil && member.stableID != "" {
+		p.tracker.RecordProbe(member.stableID, success)
+	}
+}
+
+// probeOnce 经节点访问 Cloudflare cdn-cgi/trace，单次取得 可用性+延迟+出口IP+国家+ASN。
+// 可用性探测与国家探测已统一为这一步（ADR-0004）：trace 成功即判可用并回填全部字段、
+// 返回全程延迟；失败即判不可用。由 entry.probe（周期健康检查）与启动探测共用，
+// 避免两套探测逻辑漂移与"可用但无国家"的不一致。
+func (p *poolOutbound) probeOnce(ctx context.Context, member *memberState) (time.Duration, error) {
+	if p.prober == nil {
+		return 0, E.New("prober not initialized")
+	}
+	dial := func(network, addr string) (net.Conn, error) {
+		return member.outbound.DialContext(ctx, network, M.ParseSocksaddr(addr))
+	}
+	res, err := p.prober.Probe(ctx, dial)
+	if err != nil {
+		if member.entry != nil {
+			member.entry.RecordFailure(err)
+		}
+		p.recordProbe(member, false)
+		return 0, err
+	}
+	if member.entry != nil {
+		member.entry.SetCountry(res.ExitIP, res.CountryCode, res.CountryName)
+		// 本地 GeoLite2-ASN 查询（可选）：未配置 geoip 时 LookupASN 返回 ok=false，ASN 字段留空
+		if asn, org, ok := geoip.LookupASN(res.ExitIP); ok {
+			member.entry.SetASN(asn, org)
+		} else {
+			member.entry.SetASN(0, "")
+		}
+		member.entry.RecordSuccessWithLatency(res.Latency)
+		member.lastLatencyMs.Store(res.Latency.Milliseconds())
+	}
+	p.recordProbe(member, true)
+	// CF 通过：国家/IP/ASN 已回填，后续常规检查降级为 apple:80 轻量探测（省 ~88% 流量）
+	member.probeMode.Store(probeModeApple)
+	return res.Latency, nil
+}
+
+// probeApple 轻量连通性探测：经节点 HTTP GET www.apple.com:80，收到响应即判可用。
+// 仅用于 CF 已通过节点的常规健康检查（probeMode=apple），不重拿国家/IP（节点更新时
+// 由 Reload 重建 member 重置为 CF 模式重探）。相比 CF trace 省 ~88% 流量（无 TLS 握手）。
+func (p *poolOutbound) probeApple(ctx context.Context, member *memberState) (time.Duration, error) {
+	dial := func(network, addr string) (net.Conn, error) {
+		return member.outbound.DialContext(ctx, network, M.ParseSocksaddr(addr))
+	}
+	start := time.Now()
+	conn, err := dial("tcp", appleEndpoint)
+	if err != nil {
+		if member.entry != nil {
+			member.entry.RecordFailure(err)
+		}
+		p.recordProbe(member, false)
+		return 0, err
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	reqLine := "GET / HTTP/1.1\r\nHost: " + appleHost + "\r\nConnection: close\r\nUser-Agent: easy-proxies/1.0\r\n\r\n"
+	if _, err := conn.Write([]byte(reqLine)); err != nil {
+		_ = conn.Close()
+		close(done)
+		if member.entry != nil {
+			member.entry.RecordFailure(err)
+		}
+		p.recordProbe(member, false)
+		return 0, err
+	}
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	_ = conn.Close()
+	close(done)
+	if err != nil || n == 0 {
+		e := err
+		if e == nil {
+			e = E.New("apple probe empty response")
+		}
+		if member.entry != nil {
+			member.entry.RecordFailure(e)
+		}
+		p.recordProbe(member, false)
+		return 0, e
+	}
+	lat := time.Since(start)
+	if member.entry != nil {
+		member.entry.RecordSuccessWithLatency(lat)
+	}
+	member.lastLatencyMs.Store(lat.Milliseconds())
+	p.recordProbe(member, true)
+	return lat, nil
+}
+
+// dispatchProbe 按节点 probeMode 分派：CF 未通过走 CF trace（拿国家），已通过走 apple:80 轻量探测。
+func (p *poolOutbound) dispatchProbe(ctx context.Context, member *memberState) (time.Duration, error) {
+	if member.probeMode.Load() == probeModeApple {
+		return p.probeApple(ctx, member)
+	}
+	return p.probeOnce(ctx, member)
 }
 
 func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
@@ -481,82 +630,19 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 	}
 }
 
-// httpProbe performs an HTTP probe through the connection and measures TTFB.
-// It sends a minimal HTTP request and waits for the first byte of response.
-func httpProbe(conn net.Conn, host string) (time.Duration, error) {
-	// Build HTTP request
-	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
-
-	// Try to set write deadline (ignore errors for connections that don't support it)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-
-	// Record time just before sending request
-	start := time.Now()
-
-	// Send HTTP request
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return 0, fmt.Errorf("write request: %w", err)
-	}
-
-	// Try to set read deadline (ignore errors for connections that don't support it)
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-	// Read first byte (TTFB - Time To First Byte)
-	reader := bufio.NewReader(conn)
-	_, err := reader.ReadByte()
-	if err != nil {
-		return 0, fmt.Errorf("read response: %w", err)
-	}
-
-	// Calculate TTFB
-	ttfb := time.Since(start)
-	return ttfb, nil
-}
-
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Total duration = dial time + HTTP probe
-		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
-		return duration, nil
+		// 分层探测：CF 通过后转 apple:80 轻量探测，省流量
+		return p.dispatchProbe(ctx, member)
 	}
 }
 
 // makeProbeByTagFunc creates a probe function that works before member initialization
 func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
-		return nil
-	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
 		return nil
 	}
 	return func(ctx context.Context) (time.Duration, error) {
@@ -582,32 +668,8 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		if member == nil {
 			return 0, E.New("member not found: ", tag)
 		}
-
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Total duration = dial time + TTFB
-		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
-		return duration, nil
+		// 分层探测：CF 通过后转 apple:80 轻量探测，省流量
+		return p.dispatchProbe(ctx, member)
 	}
 }
 

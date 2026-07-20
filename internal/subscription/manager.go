@@ -3,7 +3,6 @@ package subscription
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/logger"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/store"
 )
 
 // Logger defines logging interface.
@@ -36,12 +36,19 @@ func WithLogger(l Logger) Option {
 	return func(m *Manager) { m.logger = l }
 }
 
+// WithStore 注入 bbolt 存储（订阅实体/状态）。提供后订阅列表与状态走 bbolt；
+// 未提供则回退到 config.Subscriptions（兼容旧配置，仅全量刷新）。
+func WithStore(s *store.Store) Option {
+	return func(m *Manager) { m.store = s }
+}
+
 // Manager handles periodic subscription refresh.
 type Manager struct {
 	mu sync.RWMutex
 
 	baseCfg *config.Config
 	boxMgr  *boxmgr.Manager
+	store   *store.Store // bbolt 订阅实体/状态（可空：兼容旧 config.Subscriptions）
 	logger  Logger
 
 	status        monitor.SubscriptionStatus
@@ -74,20 +81,76 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 	return m
 }
 
-// Start begins the periodic refresh loop.
+// SyncSubscriptions 双向同步 config.yaml 与 bbolt 的订阅定义。
+// yaml 为权威源（用户可编辑 name/url）：yaml 有而 bbolt 无的 → upsert；
+// bbolt 有而 yaml 无的 → 删除（用户从文件移除即生效）。
+// 特例：yaml 为空但 bbolt 非空（首次升级/纯 API 管理）→ 把 bbolt 提升写回 yaml，不删除，避免误清。
+// 运行时状态（刷新状态/节点数/时间戳）始终留在 bbolt，按 URL 关联保留。
+func SyncSubscriptions(cfg *config.Config, st *store.Store) error {
+	if st == nil {
+		return nil
+	}
+	yamlNames := make(map[string]string, len(cfg.Subscriptions)) // url -> name
+	for _, entry := range cfg.Subscriptions {
+		name, u := parseSubscriptionEntry(entry)
+		if u == "" {
+			continue
+		}
+		yamlNames[u] = name
+	}
+
+	boltSubs, err := st.ListSubscriptions()
+	if err != nil {
+		return fmt.Errorf("list subscriptions: %w", err)
+	}
+
+	// 特例：yaml 空 + bbolt 非空 → 提升 bbolt 到 yaml，不删除
+	if len(yamlNames) == 0 && len(boltSubs) > 0 {
+		cfg.Subscriptions = store.SubscriptionEntries(boltSubs)
+		if err := cfg.SaveSubscriptions(); err != nil {
+			return fmt.Errorf("promote subscriptions to yaml: %w", err)
+		}
+		return nil
+	}
+
+	// yaml 权威：upsert yaml 的（已存在则同步 name，状态保留）
+	for u, name := range yamlNames {
+		existing, err := st.FindSubscriptionByURL(u)
+		if err != nil {
+			return fmt.Errorf("find subscription %s: %w", u, err)
+		}
+		if existing != nil {
+			if name != "" && existing.Name != name {
+				existing.Name = name
+				if err := st.UpdateSubscription(existing); err != nil {
+					return fmt.Errorf("update subscription %s: %w", u, err)
+				}
+			}
+			continue
+		}
+		if _, err := st.CreateSubscription(name, u, ""); err != nil {
+			return fmt.Errorf("create subscription %s: %w", u, err)
+		}
+	}
+	// yaml 没有的 bbolt 订阅 → 删除（用户从文件移除即生效）
+	for _, s := range boltSubs {
+		if _, ok := yamlNames[s.URL]; !ok {
+			if err := st.DeleteSubscription(s.ID); err != nil {
+				return fmt.Errorf("delete orphan subscription %s: %w", s.URL, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Start 启动刷新循环。即使 subscription_refresh.enabled=false 或启动时无订阅也启动循环，
+// 以保证运行时经 API 新增订阅后，手动刷新（manualRefresh 信号）始终可用；
+// 定时 ticker 仅在 enabled=true 时生效（refreshLoop 内用 nil-channel 模式控制）。
 func (m *Manager) Start() {
-	if !m.baseCfg.SubscriptionRefresh.Enabled {
-		m.logger.Infof("subscription refresh disabled")
-		return
-	}
-	if len(m.baseCfg.Subscriptions) == 0 {
-		m.logger.Infof("no subscriptions configured, refresh disabled")
-		return
-	}
-
 	interval := m.baseCfg.SubscriptionRefresh.Interval
-	m.logger.Infof("starting subscription refresh, interval: %s", interval)
-
+	if interval <= 0 {
+		interval = time.Hour
+	}
 	go m.refreshLoop(interval)
 }
 
@@ -136,6 +199,18 @@ func (m *Manager) RefreshNow() error {
 	}
 }
 
+// RefreshOne 刷新单个订阅（POST /subscriptions/{id}/refresh）。
+// 当前实现触发一次完整刷新，以保证手动节点保留 + 跨订阅去重一致；
+// 单订阅增量合并（仅替换该订阅节点）留待后续优化。
+func (m *Manager) RefreshOne(subID uint64) error {
+	if m.store != nil && subID != 0 {
+		if sub, err := m.store.GetSubscription(subID); err != nil || sub == nil {
+			return fmt.Errorf("订阅 %d 不存在", subID)
+		}
+	}
+	return m.RefreshNow()
+}
+
 // Status returns the current refresh status.
 func (m *Manager) Status() monitor.SubscriptionStatus {
 	m.mu.RLock()
@@ -147,32 +222,41 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 	return status
 }
 
-// refreshLoop runs the periodic refresh.
+// refreshLoop 消费手动刷新信号；定时 ticker 仅在 enabled=true 时创建并生效。
+// enabled=false 时 tickCh 为 nil channel，select 该 case 永久阻塞，只剩手动刷新与退出信号——
+// 这样手动刷新始终可用，不受 enabled 开关影响。
 func (m *Manager) refreshLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Update next refresh time
-	m.mu.Lock()
-	m.status.NextRefresh = time.Now().Add(interval)
-	m.mu.Unlock()
+	var ticker *time.Ticker
+	var tickCh <-chan time.Time
+	if m.baseCfg.SubscriptionRefresh.Enabled {
+		ticker = time.NewTicker(interval)
+		defer ticker.Stop()
+		tickCh = ticker.C
+		m.mu.Lock()
+		m.status.NextRefresh = time.Now().Add(interval)
+		m.mu.Unlock()
+		m.logger.Infof("subscription periodic refresh started, interval: %s", interval)
+	} else {
+		m.logger.Infof("subscription periodic refresh idle (disabled); manual refresh still available")
+	}
 
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-tickCh:
 			m.doRefresh()
 			m.mu.Lock()
 			m.status.NextRefresh = time.Now().Add(interval)
 			m.mu.Unlock()
 		case <-m.manualRefresh:
 			m.doRefresh()
-			// Reset ticker after manual refresh
-			ticker.Reset(interval)
-			m.mu.Lock()
-			m.status.NextRefresh = time.Now().Add(interval)
-			m.mu.Unlock()
+			if ticker != nil {
+				ticker.Reset(interval)
+				m.mu.Lock()
+				m.status.NextRefresh = time.Now().Add(interval)
+				m.mu.Unlock()
+			}
 		}
 	}
 }
@@ -199,6 +283,16 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("starting subscription refresh")
 
+	// 无订阅时跳过（不报错、不 reload），避免定时/手动空跑把状态污染成 error。
+	if len(m.subscriptions()) == 0 {
+		m.logger.Infof("no subscriptions configured, skip refresh")
+		m.mu.Lock()
+		m.status.LastRefresh = time.Now()
+		m.status.LastError = ""
+		m.mu.Unlock()
+		return
+	}
+
 	// Fetch nodes from all subscriptions
 	nodes, err := m.fetchAllSubscriptions()
 	if err != nil {
@@ -221,29 +315,7 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
 
-	// Write subscription nodes to nodes.txt
-	nodesFilePath := m.getNodesFilePath()
-	if err := m.writeNodesToFile(nodesFilePath, nodes); err != nil {
-		m.logger.Errorf("failed to write nodes.txt: %v", err)
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("write nodes.txt: %v", err)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
-	}
-	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
-
-	// Update hash and mod time after writing
-	newHash := m.computeNodesHash(nodes)
-	m.mu.Lock()
-	m.lastSubHash = newHash
-	if info, err := os.Stat(nodesFilePath); err == nil {
-		m.lastNodesModTime = info.ModTime()
-	} else {
-		m.lastNodesModTime = time.Now()
-	}
-	m.status.NodesModified = false
-	m.mu.Unlock()
+	// 订阅节点不再持久化到 nodes.txt：每次刷新重新拉取；手动节点已在 config.yaml（修 D1）
 
 	// Get current port mapping to preserve existing node ports
 	portMap := m.boxMgr.CurrentPortMap()
@@ -263,11 +335,11 @@ func (m *Manager) doRefresh() {
 
 	m.mu.Lock()
 	m.status.LastRefresh = time.Now()
-	m.status.NodeCount = len(nodes)
+	m.status.NodeCount = len(newCfg.Nodes) // 手动 + 订阅
 	m.status.LastError = ""
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d nodes active", len(nodes))
+	m.logger.Infof("subscription refresh completed, %d nodes active", len(newCfg.Nodes))
 }
 
 // getNodesFilePath returns the path to nodes.txt.
@@ -389,6 +461,87 @@ func parseSubscriptionEntry(entry string) (name, url string) {
 }
 
 // fetchAllSubscriptions fetches nodes from all configured subscription URLs.
+// subItem 订阅刷新单元（来自 bbolt store 或 config.Subscriptions）。
+type subItem struct {
+	ID   uint64 // store 订阅 ID（回退 config.Subscriptions 时为 0）
+	Name string
+	URL  string
+}
+
+// subscriptions 返回待刷新的订阅列表：优先 bbolt store，回退 config.Subscriptions。
+func (m *Manager) subscriptions() []subItem {
+	if m.store != nil {
+		if subs, err := m.store.ListSubscriptions(); err == nil && len(subs) > 0 {
+			items := make([]subItem, 0, len(subs))
+			for _, s := range subs {
+				items = append(items, subItem{ID: s.ID, Name: s.Name, URL: s.URL})
+			}
+			return items
+		}
+	}
+	entries := m.baseCfg.SubscriptionsList() // 持锁拷贝，防与订阅 CRUD 写 yaml 竞争
+	items := make([]subItem, 0, len(entries))
+	for _, entry := range entries {
+		name, u := parseSubscriptionEntry(entry)
+		items = append(items, subItem{Name: name, URL: u})
+	}
+	return items
+}
+
+// updateSubStatus 写订阅刷新状态到 bbolt（best-effort；id=0 或无 store 时跳过）。
+func (m *Manager) updateSubStatus(id uint64, status, lastErr string, nodeCount int) {
+	if m.store == nil || id == 0 {
+		return
+	}
+	sub, err := m.store.GetSubscription(id)
+	if err != nil || sub == nil {
+		return
+	}
+	sub.LastRefreshStatus = status
+	sub.LastError = lastErr
+	sub.NodeCount = nodeCount
+	if status == store.SubStatusSuccess || status == store.SubStatusFailed {
+		sub.LastRefreshAt = time.Now()
+	}
+	_ = m.store.UpdateSubscription(sub)
+}
+
+// fetchOne 拉取单个订阅：标注 source=subscription、stable_id（订阅公式）、写 bbolt 状态。
+func (m *Manager) fetchOne(item subItem, timeout time.Duration) ([]config.NodeConfig, error) {
+	m.updateSubStatus(item.ID, store.SubStatusRunning, "", 0)
+	nodes, err := m.fetchSubscription(item.URL, timeout)
+	if err != nil {
+		m.updateSubStatus(item.ID, store.SubStatusFailed, err.Error(), 0)
+		return nil, err
+	}
+	// 订阅名后缀 + 从 URI fragment 提取节点名
+	if item.Name != "" {
+		for idx := range nodes {
+			if nodes[idx].Name == "" {
+				if parsed, err := url.Parse(nodes[idx].URI); err == nil && parsed.Fragment != "" {
+					if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
+						nodes[idx].Name = decoded
+					} else {
+						nodes[idx].Name = parsed.Fragment
+					}
+				}
+			}
+			if nodes[idx].Name != "" {
+				nodes[idx].Name = nodes[idx].Name + "|" + item.Name
+			}
+		}
+	}
+	// 标注订阅来源 + 跨刷新稳定主键（订阅公式，data-model §1.4）
+	for idx := range nodes {
+		nodes[idx].Source = config.NodeSourceSubscription
+		nodes[idx].SubscriptionID = item.ID
+		nodes[idx].StableID = config.StableID(config.NodeSourceSubscription, item.ID, nodes[idx].URI)
+	}
+	m.updateSubStatus(item.ID, store.SubStatusSuccess, "", len(nodes))
+	m.logger.Infof("fetched %d nodes from subscription %s", len(nodes), item.URL)
+	return nodes, nil
+}
+
 func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 	var allNodes []config.NodeConfig
 	var lastErr error
@@ -398,38 +551,13 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 		timeout = 30 * time.Second
 	}
 
-	for _, subEntry := range m.baseCfg.Subscriptions {
-		// 解析订阅名字和URL：格式为 "订阅名字:URL" 或 "URL"
-		subName, subURL := parseSubscriptionEntry(subEntry)
-
-		nodes, err := m.fetchSubscription(subURL, timeout)
+	for _, item := range m.subscriptions() {
+		nodes, err := m.fetchOne(item, timeout)
 		if err != nil {
-			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
+			m.logger.Warnf("failed to fetch %s: %v", item.URL, err)
 			lastErr = err
 			continue
 		}
-		m.logger.Infof("fetched %d nodes from subscription", len(nodes))
-
-		// 如果有订阅名字，添加到节点名称后
-		if subName != "" {
-			for idx := range nodes {
-				// 先从 URI 的 fragment 中提取节点名称（如果还没有提取）
-				if nodes[idx].Name == "" {
-					if parsed, err := url.Parse(nodes[idx].URI); err == nil && parsed.Fragment != "" {
-						if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
-							nodes[idx].Name = decoded
-						} else {
-							nodes[idx].Name = parsed.Fragment
-						}
-					}
-				}
-				// 添加订阅名字后缀
-				if nodes[idx].Name != "" {
-					nodes[idx].Name = nodes[idx].Name + "|" + subName
-				}
-			}
-		}
-
 		allNodes = append(allNodes, nodes...)
 	}
 
@@ -468,104 +596,58 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	return parseSubscriptionContent(string(body))
+	return config.ParseSubscriptionContent(string(body))
 }
 
-// createNewConfig creates a new config with updated nodes while preserving other settings.
-func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
+// createNewConfig 构建刷新后的配置：保留手动节点（source!=subscription）+ 新拉订阅节点。
+// 不再覆写 nodes.txt；手动节点持久化于 config.yaml，订阅节点每次刷新重新拉取（修 D1）。
+func (m *Manager) createNewConfig(subNodes []config.NodeConfig) *config.Config {
 	// Deep copy base config
 	newCfg := *m.baseCfg
 
-	// Assign port numbers to nodes in multi-port mode
+	// 合并：保留非订阅节点（manual/inline/file）+ 新拉订阅节点（旧订阅节点丢弃）
+	merged := make([]config.NodeConfig, 0, len(m.baseCfg.Nodes)+len(subNodes))
+	for _, n := range m.baseCfg.Nodes {
+		if n.Source == config.NodeSourceSubscription {
+			continue
+		}
+		merged = append(merged, n)
+	}
+	merged = append(merged, subNodes...)
+
+	// multi-port 模式端口分配
 	if newCfg.Mode == "multi-port" {
 		portCursor := newCfg.MultiPort.BasePort
-		for i := range nodes {
-			nodes[i].Port = portCursor
+		for i := range merged {
+			merged[i].Port = portCursor
 			portCursor++
-			// Apply default credentials
-			if nodes[i].Username == "" {
-				nodes[i].Username = newCfg.MultiPort.Username
-				nodes[i].Password = newCfg.MultiPort.Password
+			if merged[i].Username == "" {
+				merged[i].Username = newCfg.MultiPort.Username
+				merged[i].Password = newCfg.MultiPort.Password
 			}
 		}
 	}
 
-	// Process node names
-	for i := range nodes {
-		nodes[i].Name = strings.TrimSpace(nodes[i].Name)
-		nodes[i].URI = strings.TrimSpace(nodes[i].URI)
-
-		// Extract name from URI fragment if not provided
-		if nodes[i].Name == "" {
-			if parsed, err := url.Parse(nodes[i].URI); err == nil && parsed.Fragment != "" {
+	// 名称处理（仅对缺名节点，手动节点保留原名）
+	for i := range merged {
+		merged[i].Name = strings.TrimSpace(merged[i].Name)
+		merged[i].URI = strings.TrimSpace(merged[i].URI)
+		if merged[i].Name == "" {
+			if parsed, err := url.Parse(merged[i].URI); err == nil && parsed.Fragment != "" {
 				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
-					nodes[i].Name = decoded
+					merged[i].Name = decoded
 				} else {
-					nodes[i].Name = parsed.Fragment
+					merged[i].Name = parsed.Fragment
 				}
 			}
 		}
-		if nodes[i].Name == "" {
-			nodes[i].Name = fmt.Sprintf("node-%d", i)
+		if merged[i].Name == "" {
+			merged[i].Name = fmt.Sprintf("node-%d", i)
 		}
 	}
 
-	newCfg.Nodes = nodes
+	newCfg.Nodes = merged
 	return &newCfg
-}
-
-// parseSubscriptionContent parses subscription content in various formats.
-// This is a simplified version - the full implementation is in config package.
-func parseSubscriptionContent(content string) ([]config.NodeConfig, error) {
-	content = strings.TrimSpace(content)
-
-	// Check if it's base64 encoded
-	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				return parseNodesFromContent(content)
-			}
-		}
-		content = string(decoded)
-	}
-
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
-}
-
-func isBase64(s string) bool {
-	s = strings.TrimSpace(s)
-	if len(s) == 0 {
-		return false
-	}
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-	if strings.Contains(s, "://") {
-		return false
-	}
-	_, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		_, err = base64.RawStdEncoding.DecodeString(s)
-	}
-	return err == nil
-}
-
-func parseNodesFromContent(content string) ([]config.NodeConfig, error) {
-	var nodes []config.NodeConfig
-	lines := strings.Split(content, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if isProxyURI(line) {
-			nodes = append(nodes, config.NodeConfig{URI: line})
-		}
-	}
-	return nodes, nil
 }
 
 func isProxyURI(s string) bool {

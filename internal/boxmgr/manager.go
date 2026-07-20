@@ -11,11 +11,13 @@ import (
 	"sync"
 	"time"
 
+	"easy_proxies/internal/availability"
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/logger"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/store"
 
 	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
@@ -54,6 +56,7 @@ type Manager struct {
 	currentBox    *box.Box
 	monitorMgr    *monitor.Manager
 	monitorServer *monitor.Server
+	store         *store.Store // bbolt 存储，ensureMonitor 创建 server 时注入（避免 Start 阻塞导致注入滞后）
 	cfg           *config.Config
 	monitorCfg    monitor.Config
 
@@ -82,6 +85,22 @@ func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager
 		m.drainTimeout = defaultDrainTimeout
 	}
 	return m
+}
+
+// SetStore 注入 bbolt 存储；ensureMonitor 创建 monitor server 时会将其注入，
+// 确保 server 在 Start 阻塞（初始健康检查）期间即可服务凭证/订阅等写端点。
+// 必须在 Start 之前调用。
+func (m *Manager) SetStore(st *store.Store) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = st
+}
+
+// PrepareMonitor 提前初始化 monitor manager 与 server（含 store 注入），使其在
+// Start 的初始健康检查阻塞前即可服务。app 层据此在阻塞前装配 virtualpool 等。
+// ensureMonitor 幂等：后续 Start 会跳过已完成的初始化。
+func (m *Manager) PrepareMonitor(ctx context.Context) error {
+	return m.ensureMonitor(ctx)
 }
 
 // Start creates and starts the initial sing-box instance.
@@ -227,7 +246,11 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.mu.Lock()
 	m.currentBox = instance
-	m.cfg = newCfg
+	// 保持 m.cfg 指针不变（与 monitor server 的 cfgSrc 共享同一对象），把 newCfg 内容拷回。
+	// 否则 reload 后 m.cfg 换成新指针、server.cfgSrc 停留在旧值，会导致“经 settings 改入口密码
+	// 后 reload 仍用旧密码”等配置不同步问题。
+	*m.cfg = *newCfg
+	m.cfg.Nodes = cloneNodes(newCfg.Nodes)
 	m.mu.Unlock()
 
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
@@ -302,6 +325,10 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 	if m.monitorMgr == nil {
 		return nil, errors.New("monitor manager not initialized")
 	}
+
+	// 重置节点注册表：新 box 启动时会重新注册当前节点集合，
+	// 避免删除/变更的节点残留 Snapshot（可用率 Tracker 按 stable_id 保留）。
+	m.monitorMgr.Reset()
 
 	opts, err := builder.Build(cfg)
 	if err != nil {
@@ -416,6 +443,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		return fmt.Errorf("init monitor manager: %w", err)
 	}
 	monitorMgr.SetLogger(monitorLoggerAdapter{logger: m.logger})
+	monitorMgr.SetTracker(availability.New())
 	m.monitorMgr = monitorMgr
 
 	var serverToStart *monitor.Server
@@ -427,6 +455,10 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		// Set NodeManager for config CRUD endpoints
 		if m.monitorServer != nil {
 			m.monitorServer.SetNodeManager(m)
+			// 注入 bbolt 存储（凭证/订阅/探测），在 server 开始服务前就位
+			if m.store != nil {
+				m.monitorServer.SetStore(m.store)
+			}
 		}
 		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
 	}
@@ -499,7 +531,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 	return cloneNodes(m.cfg.Nodes), nil
 }
 
-// CreateNode adds a new node to the config and saves it.
+// CreateNode adds a new node to the config, saves it, and triggers a hot reload.
 func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -508,91 +540,104 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if m.cfg == nil {
+		m.mu.Unlock()
 		return config.NodeConfig{}, errConfigUnavailable
 	}
 
 	normalized, err := m.prepareNodeLocked(node, "")
 	if err != nil {
+		m.mu.Unlock()
 		return config.NodeConfig{}, err
 	}
 
-	// Determine source: if subscriptions exist, new nodes go to nodes.txt (subscription source)
-	// Otherwise, if nodes_file exists, use file source; else inline
-	if len(m.cfg.Subscriptions) > 0 {
-		normalized.Source = config.NodeSourceSubscription
-	} else if m.cfg.NodesFile != "" {
-		normalized.Source = config.NodeSourceFile
-	} else {
-		normalized.Source = config.NodeSourceInline
-	}
+	// 经 API 创建的节点一律为 manual 源：持久化到 config.yaml，不被订阅刷新覆盖
+	normalized.Source = config.NodeSourceManual
+	normalized.StableID = config.StableID(normalized.Source, 0, normalized.URI)
 
 	m.cfg.Nodes = append(m.cfg.Nodes, normalized)
 	if err := m.cfg.Save(); err != nil {
 		m.cfg.Nodes = m.cfg.Nodes[:len(m.cfg.Nodes)-1]
+		m.mu.Unlock()
 		return config.NodeConfig{}, fmt.Errorf("save config: %w", err)
+	}
+	m.mu.Unlock()
+
+	// 隐式热重载（替代独立 /reload 端点）；reload 失败不回滚已持久化的 CRUD
+	if err := m.TriggerReload(ctx); err != nil && m.logger != nil {
+		m.logger.Warnf("create node reload failed: %v", err)
 	}
 	return normalized, nil
 }
 
-// UpdateNode updates an existing node by name and saves the config.
-func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error) {
+// UpdateNode updates an existing node by stable_id, saves the config, and hot-reloads.
+func (m *Manager) UpdateNode(ctx context.Context, stableID string, node config.NodeConfig) (config.NodeConfig, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return config.NodeConfig{}, err
 		}
 	}
 
-	name = strings.TrimSpace(name)
+	stableID = strings.TrimSpace(stableID)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if m.cfg == nil {
+		m.mu.Unlock()
 		return config.NodeConfig{}, errConfigUnavailable
 	}
 
-	idx := m.nodeIndexLocked(name)
+	idx := m.nodeIndexByStableLocked(stableID)
 	if idx == -1 {
+		m.mu.Unlock()
 		return config.NodeConfig{}, monitor.ErrNodeNotFound
 	}
 
-	normalized, err := m.prepareNodeLocked(node, name)
+	prev := m.cfg.Nodes[idx]
+	normalized, err := m.prepareNodeLocked(node, prev.Name)
 	if err != nil {
+		m.mu.Unlock()
 		return config.NodeConfig{}, err
 	}
 
-	// Preserve the original source
-	normalized.Source = m.cfg.Nodes[idx].Source
+	// 保留原 source/订阅归属；URI 变更后 stable_id 按新 URI 重算
+	normalized.Source = prev.Source
+	normalized.SubscriptionID = prev.SubscriptionID
+	normalized.StableID = config.StableID(normalized.Source, prev.SubscriptionID, normalized.URI)
 
-	prev := m.cfg.Nodes[idx]
 	m.cfg.Nodes[idx] = normalized
 	if err := m.cfg.Save(); err != nil {
 		m.cfg.Nodes[idx] = prev
+		m.mu.Unlock()
 		return config.NodeConfig{}, fmt.Errorf("save config: %w", err)
+	}
+	m.mu.Unlock()
+
+	if err := m.TriggerReload(ctx); err != nil && m.logger != nil {
+		m.logger.Warnf("update node reload failed: %v", err)
 	}
 	return normalized, nil
 }
 
-// DeleteNode removes a node by name and saves the config.
-func (m *Manager) DeleteNode(ctx context.Context, name string) error {
+// DeleteNode removes a node by stable_id, saves the config, and hot-reloads.
+func (m *Manager) DeleteNode(ctx context.Context, stableID string) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
 
-	name = strings.TrimSpace(name)
+	stableID = strings.TrimSpace(stableID)
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if m.cfg == nil {
+		m.mu.Unlock()
 		return errConfigUnavailable
 	}
 
-	idx := m.nodeIndexLocked(name)
+	idx := m.nodeIndexByStableLocked(stableID)
 	if idx == -1 {
+		m.mu.Unlock()
 		return monitor.ErrNodeNotFound
 	}
 
@@ -600,7 +645,13 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
 	if err := m.cfg.Save(); err != nil {
 		m.cfg.Nodes = backup
+		m.mu.Unlock()
 		return fmt.Errorf("save config: %w", err)
+	}
+	m.mu.Unlock()
+
+	if err := m.TriggerReload(ctx); err != nil && m.logger != nil {
+		m.logger.Warnf("delete node reload failed: %v", err)
 	}
 	return nil
 }
@@ -698,7 +749,7 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 	// Build set of used ports
 	usedPorts := make(map[uint16]bool)
 	if cfg.Mode == "hybrid" {
-		usedPorts[cfg.Listener.Port] = true
+		usedPorts[cfg.Pool.Port] = true
 	}
 	for _, node := range cfg.Nodes {
 		usedPorts[node.Port] = true
@@ -756,6 +807,19 @@ func (m *Manager) nodeIndexLocked(name string) int {
 	return -1
 }
 
+// nodeIndexByStableLocked 按 stable_id 定位节点（新 API v1 契约主键）。
+func (m *Manager) nodeIndexByStableLocked(stableID string) int {
+	if stableID == "" {
+		return -1
+	}
+	for idx, node := range m.cfg.Nodes {
+		if node.StableID == stableID {
+			return idx
+		}
+	}
+	return -1
+}
+
 func (m *Manager) portInUseLocked(port uint16, currentName string) bool {
 	if port == 0 {
 		return false
@@ -801,6 +865,11 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 
 	if node.URI == "" {
 		return config.NodeConfig{}, fmt.Errorf("%w: URI 不能为空", monitor.ErrInvalidNode)
+	}
+	// 添加前置校验：解析 URI 验证协议支持 + 必要字段（纯解析，不查连通性，不触碰运行实例）。
+	// 失败直接拒绝——节点不进配置、不 reload，不影响当前运行的代理（同 Clash 行为）。
+	if err := builder.ValidateNodeURI(node.URI, m.cfg.SkipCertVerify); err != nil {
+		return config.NodeConfig{}, fmt.Errorf("%w: %v", monitor.ErrInvalidNode, err)
 	}
 
 	// Extract name from URI fragment (#name) if not provided

@@ -1,0 +1,60 @@
+name: Build Windows Binary
+
+# 构建原生 Windows amd64 可执行文件，产物作为 workflow artifact 上传（不创建 Release）。
+# - push 到 main/master：滚动构建，artifact 名固定 easy-proxies-windows-amd64
+# - 手动触发（workflow_dispatch）：可填 version（如 v1.0.0），artifact 名带版本后缀
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label (e.g. v1.0.0；留空则构建无版本标签的滚动产物)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      # 交叉编译 Windows amd64（CGO 禁用，纯 Go；与 sing-box 官方多平台构建一致）
+      - name: Build Windows amd64 binary
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" \
+            -trimpath -ldflags="-s -w" \
+            -o easy-proxies.exe ./cmd/easy_proxies
+
+      - name: Prepare artifact name
+        id: name
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [[ -n "$V" ]]; then
+            echo "artifact=easy-proxies-${V}-windows-amd64" >> $GITHUB_OUTPUT
+          else
+            echo "artifact=easy-proxies-windows-amd64" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.artifact }}
+          path: easy-proxies.exe
+          if-no-files-found: error
+          retention-days: 90

@@ -128,14 +128,12 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # 只有 tag 或手动触发时才更新 :latest
-          if [[ "${{ github.ref_type }}" == "tag" ]] || [[ -n "${{ github.event.inputs.version }}" ]]; then
-            docker manifest create ${IMAGE}:latest \
-              ${IMAGE}:${VERSION}-amd64 \
-              ${IMAGE}:${VERSION}-arm64
-            docker manifest push ${IMAGE}:latest
-            echo "✅ Also updated :latest"
-          fi
+          # 每次构建都更新 :latest（push / tag / 手动触发均覆盖，rolling latest）
+          docker manifest create ${IMAGE}:latest \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+          docker manifest push ${IMAGE}:latest
+          echo "✅ Also updated :latest"
 
           echo "🎉 Success!"
           echo "   Image: ${IMAGE}:${VERSION} (amd64 + arm64)"

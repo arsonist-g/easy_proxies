@@ -45,10 +45,14 @@ type VirtualPool struct {
 
 // NewVirtualPool 创建虚拟池实例
 func NewVirtualPool(ctx context.Context, cfg config.VirtualPoolConfig, monitorMgr *monitor.Manager, globalCfg *config.Config) (*VirtualPool, error) {
-	// 编译正则表达式（使用 regexp2 支持零宽断言）
-	regex, err := regexp2.Compile(cfg.Regular, regexp2.RE2)
-	if err != nil {
-		return nil, fmt.Errorf("compile regex: %w", err)
+	// 编译正则表达式（使用 regexp2 支持零宽断言）；Regular 为空表示不按节点名过滤
+	var regex *regexp2.Regexp
+	if cfg.Regular != "" {
+		compiled, err := regexp2.Compile(cfg.Regular, regexp2.RE2)
+		if err != nil {
+			return nil, fmt.Errorf("compile regex: %w", err)
+		}
+		regex = compiled
 	}
 
 	poolCtx, cancel := context.WithCancel(ctx)
@@ -153,23 +157,55 @@ func (p *VirtualPool) updateNodeCache() {
 	// 获取所有可用节点
 	allNodes := p.monitorMgr.SnapshotFiltered(true)
 
-	// 筛选匹配正则的节点
+	// 筛选节点：先国家码（基于探测结果，准确），再正则（可选），最后延迟阈值
 	var matchedNodes []monitor.Snapshot
 	for _, node := range allNodes {
-		matched, err := p.regex.MatchString(node.Name)
-		if err != nil {
-			logger.Warnf("Virtual pool %q regex match error: %v", p.cfg.Name, err)
-			continue
-		}
-		if matched {
-			// 检查延迟阈值
-			if p.cfg.MaxLatencyMs > 0 && node.LastLatencyMs > 0 {
-				if node.LastLatencyMs > int64(p.cfg.MaxLatencyMs) {
-					continue
+		// 国家过滤：包含列表非空时节点须命中其一（未探测国家的节点排除）；排除列表命中则跳过（未探测国家不受排除影响）
+		if len(p.cfg.CountryCodes) > 0 {
+			if node.CountryCode == "" {
+				continue
+			}
+			ok := false
+			for _, c := range p.cfg.CountryCodes {
+				if strings.EqualFold(c, node.CountryCode) {
+					ok = true
+					break
 				}
 			}
-			matchedNodes = append(matchedNodes, node)
+			if !ok {
+				continue
+			}
 		}
+		if len(p.cfg.ExcludedCountryCodes) > 0 && node.CountryCode != "" {
+			excluded := false
+			for _, c := range p.cfg.ExcludedCountryCodes {
+				if strings.EqualFold(c, node.CountryCode) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+		// 正则过滤：regex 为 nil（Regular 为空）时跳过，仅按名字进一步缩小范围
+		if p.regex != nil {
+			matched, err := p.regex.MatchString(node.Name)
+			if err != nil {
+				logger.Warnf("Virtual pool %q regex match error: %v", p.cfg.Name, err)
+				continue
+			}
+			if !matched {
+				continue
+			}
+		}
+		// 延迟阈值
+		if p.cfg.MaxLatencyMs > 0 && node.LastLatencyMs > 0 {
+			if node.LastLatencyMs > int64(p.cfg.MaxLatencyMs) {
+				continue
+			}
+		}
+		matchedNodes = append(matchedNodes, node)
 	}
 
 	p.nodeCacheMu.Lock()
@@ -219,6 +255,16 @@ func (p *VirtualPool) selectNode(nodes []monitor.Snapshot) *monitor.Snapshot {
 				idx = i
 			}
 		}
+	case "weighted":
+		// 加权随机：按延迟+可用率综合得分概率抽取（monitor.WeightedScore）
+		scores := make([]float64, len(nodes))
+		for i, node := range nodes {
+			scores[i] = monitor.WeightedScore(node.LastLatencyMs, node.AvailabilityRate, node.TotalAttempts,
+				p.cfg.LatencyWeight, p.cfg.AvailabilityWeight)
+		}
+		p.rngMu.Lock()
+		idx = monitor.PickWeighted(scores, p.rng)
+		p.rngMu.Unlock()
 	default: // sequential
 		idx = int(p.rrCounter.Add(1)-1) % len(nodes)
 	}
@@ -284,6 +330,12 @@ func (p *VirtualPool) handleConnection(clientConn net.Conn) {
 		return
 	}
 
+	// 记录转发调用结果（可用率 call 路）：默认失败，成功路径置位
+	callOK := false
+	defer func() {
+		p.recordCall(selectedNode, callOK)
+	}()
+
 	// 调试日志：显示选择的节点（归为 debug 级别）
 	logger.Debugf("Virtual pool %q selected node: %s (port: %d, strategy: %s, total nodes: %d)",
 		p.cfg.Name, selectedNode.Name, selectedNode.Port, p.cfg.Strategy, len(nodes))
@@ -342,6 +394,7 @@ func (p *VirtualPool) handleConnection(clientConn net.Conn) {
 
 	// 向客户端发送成功响应
 	p.sendResponse(clientConn, "200 Connection Established", nil)
+	callOK = true // 上游 CONNECT 成功，计为成功调用
 
 	// 开始双向转发
 	p.relay(clientConn, proxyConn)
@@ -422,4 +475,14 @@ func (p *VirtualPool) relay(client, server net.Conn) {
 	}()
 
 	wg.Wait()
+}
+
+// recordCall 记录一次虚拟池转发调用结果到节点可用率统计（call 路）。
+func (p *VirtualPool) recordCall(node *monitor.Snapshot, success bool) {
+	if node == nil || node.StableID == "" || p.monitorMgr == nil {
+		return
+	}
+	if t := p.monitorMgr.Tracker(); t != nil {
+		t.RecordCall(node.StableID, success)
+	}
 }

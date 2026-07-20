@@ -14,6 +14,8 @@ import (
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
+
+	"easy_proxies/internal/availability"
 )
 
 // Config mirrors user settings needed by the monitoring server.
@@ -32,6 +34,7 @@ type Config struct {
 // NodeInfo is static metadata about a proxy entry.
 type NodeInfo struct {
 	Tag           string `json:"tag"`
+	StableID      string `json:"stable_id,omitempty"` // 跨刷新稳定主键（data-model §1.4）
 	Name          string `json:"name"`
 	URI           string `json:"uri"`
 	Mode          string `json:"mode"`
@@ -55,6 +58,23 @@ type Snapshot struct {
 	LastLatencyMs     int64         `json:"last_latency_ms"`
 	Available         bool          `json:"available"`          // 节点是否可用
 	InitialCheckDone  bool          `json:"initial_check_done"` // 初始检查是否完成
+
+	// 国家/出口（国家探测后回填，见 internal/countryprobe）
+	ExitIP      string `json:"exit_ip,omitempty"`
+	CountryCode string `json:"country_code,omitempty"`
+	CountryName string `json:"country_name,omitempty"`
+	// ASN（本地 GeoLite2-ASN 查询，可选；未配置 geoip 则留空）
+	ASN    uint   `json:"asn,omitempty"`
+	ASNOrg string `json:"asn_org,omitempty"`
+
+	// 去重（跨订阅按 exit_ip 去重，duplicate_of 指向留存节点 stable_id）
+	DuplicateOf string `json:"duplicate_of,omitempty"`
+
+	// 可用率（来自 internal/availability Tracker，由 Manager 合并）
+	AvailabilityRate float64 `json:"availability_rate"`
+	TotalAttempts    int64   `json:"total_attempts"` // probe_total + call_total
+	TotalSuccess     int64   `json:"total_success"`  // probe_success + call_success
+	CallTotal        int64   `json:"call_total"`     // 真实转发调用次数（dashboard 单独透出）
 }
 
 type probeFunc func(ctx context.Context) (time.Duration, error)
@@ -78,6 +98,12 @@ type entry struct {
 	release          releaseFunc
 	initialCheckDone bool // 初始健康检查是否完成
 	available        bool // 节点是否可用（初始检查通过）
+	exitIP           string // 国家探测得到的出口真实 IP
+	countryCode      string
+	countryName      string
+	asn              uint // 本地 GeoLite2-ASN 查询（可选）
+	asnOrg           string
+	duplicateOf      string // 去重：指向留存节点的 stable_id
 	mu               sync.RWMutex
 }
 
@@ -91,6 +117,7 @@ type Manager struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	logger     Logger
+	tracker    *availability.Tracker // 可用率统计（转发/探测计数），可空
 }
 
 // Logger interface for logging
@@ -141,6 +168,16 @@ func NewManager(cfg Config) (*Manager, error) {
 // SetLogger sets the logger for the manager.
 func (m *Manager) SetLogger(logger Logger) {
 	m.logger = logger
+}
+
+// SetTracker 注入可用率统计器，供 Snapshot 合并 probe/call 计数。
+func (m *Manager) SetTracker(t *availability.Tracker) {
+	m.tracker = t
+}
+
+// Tracker 返回可用率统计器（转发/探测路径调用，可能为 nil）。
+func (m *Manager) Tracker() *availability.Tracker {
+	return m.tracker
 }
 
 // StartPeriodicHealthCheck starts a background goroutine that periodically checks all nodes.
@@ -236,7 +273,13 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 				entry.available = true
 				entry.initialCheckDone = true
 			}
+			sid := entry.info.StableID
 			entry.mu.Unlock()
+
+			// 记录可用率（probe 路），无锁 atomic，不阻塞热路径
+			if m.tracker != nil && sid != "" {
+				m.tracker.RecordProbe(sid, err == nil)
+			}
 
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
@@ -248,6 +291,14 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	if m.logger != nil {
 		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
+
+	// 周期去重：按出口 IP 标记重复节点（countryprobe 回填 exit_ip 后逐步收敛）
+	m.DedupByExitIP()
+}
+
+// ProbeAll 触发一次全节点健康探测（API POST /probe/all 用）。
+func (m *Manager) ProbeAll(timeout time.Duration) {
+	m.probeAllNodes(timeout)
 }
 
 // Stop stops the periodic health check.
@@ -255,6 +306,15 @@ func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+}
+
+// Reset 清空已注册节点（box 重建前由 boxmgr 调用）。
+// 新 box 启动时会经 pool 重新 Register 当前节点集合，避免删除/变更的节点残留 Snapshot。
+// 不清 availability Tracker：可用率按 stable_id 累积，跨 reload 保留（同公式同 key）。
+func (m *Manager) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nodes = make(map[string]*entry)
 }
 
 func parsePort(value string) uint16 {
@@ -306,6 +366,14 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 	snapshots := make([]Snapshot, 0, len(list))
 	for _, e := range list {
 		snap := e.snapshot()
+		// 合并可用率统计（probe/call 计数），按 stable_id 查 Tracker
+		if m.tracker != nil && snap.StableID != "" {
+			av := m.tracker.Snapshot(snap.StableID)
+			snap.AvailabilityRate = av.Rate
+			snap.TotalAttempts = av.Total
+			snap.TotalSuccess = av.Success
+			snap.CallTotal = av.CallTotal
+		}
 		// 如果只要可用节点：
 		// - 跳过已完成检查但不可用的节点
 		// - 保留未完成检查的节点（它们会在首次使用时被检查）
@@ -401,6 +469,12 @@ func (e *entry) snapshot() Snapshot {
 		LastLatencyMs:     latencyMs,
 		Available:         e.available,
 		InitialCheckDone:  e.initialCheckDone,
+		ExitIP:            e.exitIP,
+		CountryCode:       e.countryCode,
+		CountryName:       e.countryName,
+		ASN:               e.asn,
+		ASNOrg:            e.asnOrg,
+		DuplicateOf:       e.duplicateOf,
 	}
 }
 
@@ -550,4 +624,161 @@ func (h *EntryHandle) MarkAvailable(available bool) {
 	h.ref.mu.Lock()
 	h.ref.available = available
 	h.ref.mu.Unlock()
+}
+
+// SetCountry 回填国家探测结果（出口 IP / 国家码 / 国名）。
+func (h *EntryHandle) SetCountry(exitIP, code, name string) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	h.ref.exitIP = exitIP
+	h.ref.countryCode = code
+	h.ref.countryName = name
+}
+
+// SetASN 回填本地 GeoLite2-ASN 查询结果（ASN / 组织名）。asn=0 且 org="" 表示未取到。
+func (h *EntryHandle) SetASN(asn uint, org string) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	h.ref.asn = asn
+	h.ref.asnOrg = org
+}
+
+// SetDuplicateOf 标记去重指向（duplicate_of 指向留存节点 stable_id）。
+func (h *EntryHandle) SetDuplicateOf(stableID string) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	h.ref.duplicateOf = stableID
+}
+
+// RecordProbeAvailability 记一次健康探测结果到可用率统计（probe 路）。
+func (h *EntryHandle) RecordProbeAvailability(tracker *availability.Tracker, success bool) {
+	if h == nil || h.ref == nil || tracker == nil {
+		return
+	}
+	tracker.RecordProbe(h.ref.info.StableID, success)
+}
+
+// SnapshotByStableID 按 stable_id 查找单个节点快照（含可用率合并）。
+func (m *Manager) SnapshotByStableID(stableID string) (Snapshot, bool) {
+	m.mu.RLock()
+	var found *entry
+	for _, e := range m.nodes {
+		if e.info.StableID == stableID {
+			found = e
+			break
+		}
+	}
+	m.mu.RUnlock()
+	if found == nil {
+		return Snapshot{}, false
+	}
+	snap := found.snapshot()
+	if m.tracker != nil && snap.StableID != "" {
+		av := m.tracker.Snapshot(snap.StableID)
+		snap.AvailabilityRate = av.Rate
+		snap.TotalAttempts = av.Total
+		snap.TotalSuccess = av.Success
+		snap.CallTotal = av.CallTotal
+	}
+	return snap, true
+}
+
+// ProbeByStableID 按 stable_id 触发单节点探测（API 端点用，内部映射 stable_id→tag）。
+func (m *Manager) ProbeByStableID(ctx context.Context, stableID string) (time.Duration, error) {
+	m.mu.RLock()
+	var tag string
+	found := false
+	for t, e := range m.nodes {
+		if e.info.StableID == stableID {
+			tag = t
+			found = true
+			break
+		}
+	}
+	m.mu.RUnlock()
+	if !found {
+		return 0, fmt.Errorf("node %s not found", stableID)
+	}
+	return m.Probe(ctx, tag)
+}
+
+// DedupByExitIP 跨订阅按出口 IP 去重：同 exit_ip 的节点保留"可用优先、延迟低优先"的最优者，
+// 其余标记 duplicate_of 指向最优节点 stable_id。exit_ip 为空（未探测）的节点不参与去重。
+// 由周期健康检查触发；随 countryprobe 回填 exit_ip 逐步收敛。
+func (m *Manager) DedupByExitIP() {
+	type ei struct {
+		stableID string
+		exitIP   string
+		latency  int64 // -1 未测
+		avail    bool
+	}
+
+	m.mu.RLock()
+	snap := make([]ei, 0, len(m.nodes))
+	for _, e := range m.nodes {
+		e.mu.RLock()
+		latMs := int64(-1)
+		if e.lastProbe > 0 {
+			latMs = e.lastProbe.Milliseconds()
+		}
+		snap = append(snap, ei{e.info.StableID, e.exitIP, latMs, e.available})
+		e.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+
+	better := func(a, b ei) bool {
+		if a.avail != b.avail {
+			return a.avail // 可用优于不可用
+		}
+		la, lb := a.latency, b.latency
+		if la < 0 {
+			la = 1 << 62
+		}
+		if lb < 0 {
+			lb = 1 << 62
+		}
+		if la != lb {
+			return la < lb
+		}
+		return a.stableID < b.stableID // 确定性兜底
+	}
+
+	// 每个 exit_ip 选最优
+	best := make(map[string]ei)
+	for _, in := range snap {
+		if in.exitIP == "" || in.stableID == "" {
+			continue
+		}
+		if cur, ok := best[in.exitIP]; !ok || better(in, cur) {
+			best[in.exitIP] = in
+		}
+	}
+
+	// 写回 duplicate_of
+	m.mu.RLock()
+	for _, e := range m.nodes {
+		e.mu.RLock()
+		ip := e.exitIP
+		sid := e.info.StableID
+		e.mu.RUnlock()
+		var dup string
+		if ip != "" && sid != "" {
+			if b, ok := best[ip]; ok && b.stableID != sid {
+				dup = b.stableID
+			}
+		}
+		e.mu.Lock()
+		e.duplicateOf = dup
+		e.mu.Unlock()
+	}
+	m.mu.RUnlock()
 }

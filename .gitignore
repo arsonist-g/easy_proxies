@@ -32,6 +32,9 @@ vendor/
 coverage.out
 coverage.html
 
+# Local test sandbox (config/nodes.txt/easy.db/logs for runtime testing)
+/run/
+
 # Qodo
 .qodo/
 CLAUDE.md
@@ -40,3 +43,15 @@ PLAN.md
 start.bat
 test.py
 .ace-tool/
+
+# Runtime data (bbolt database / GeoIP mmdb downloads)
+*.db
+*.mmdb
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Scratch & temporary working docs
+tmp-doc/
+sketch.md
