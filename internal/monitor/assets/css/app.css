@@ -243,6 +243,25 @@
   .cp-mark { width:14px; text-align:center; font-size:12px; font-weight:700; flex-shrink:0; }
   .cp-item.inc .cp-mark { color:var(--primary); }
   .cp-item.exc .cp-mark { color:var(--error); }
+
+  /* 访问控制：省份/运营商小卡片网格（点击选中，蓝底高亮）。
+     复用 cp-item 的交互心智，但省名短、无国旗/计数 → 更紧凑、居中。 */
+  /* 省份/运营商：紧凑自适应小卡片（内容宽度，flex 换行铺排），选中=实色蓝+白字，对比鲜明 */
+  .prov-grid { display:flex; flex-wrap:wrap; gap:6px; }
+  .prov-tile { display:inline-flex; align-items:center; justify-content:center;
+    padding:6px 14px; font-size:12px; cursor:pointer; user-select:none; white-space:nowrap;
+    border:1px solid var(--border-strong); border-radius:var(--radius-sm);
+    background:var(--surface-2); color:var(--text-secondary);
+    transition:background .12s, color .12s, border-color .12s; }
+  .prov-tile:hover { background:var(--surface-3); color:var(--text-primary); }
+  .prov-tile.on { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:600; }
+  .prov-tile.on:hover { background:var(--primary-hover); }
+
+  /* GeoCN 未就绪时，省份/运营商/仅中国/IDC/未知ISP 整块禁用（变灰、不可点）；提示语在块外正常显示 */
+  .ac-geo-block.ac-disabled { opacity:0.45; pointer-events:none; }
+  .ac-geo-note { font-size:12px; color:var(--text-secondary); background:var(--surface-2);
+    border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:8px 12px; margin:14px 0 10px; }
+  .ac-check { display:flex; align-items:center; gap:10px; cursor:pointer; }
   .cp-count-label { font-size:12px; color:var(--text-secondary); margin-right:auto; }
   .cp-overview { margin-bottom:16px; }
   .cp-overview-title { font-size:11px; font-weight:600; color:var(--text-tertiary); text-transform:uppercase;

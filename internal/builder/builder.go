@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -13,22 +12,24 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/logger"
 	poolout "easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/poolgateway"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
-// Build converts high level config into sing-box Options tree.
-func Build(cfg *config.Config) (option.Options, error) {
+// Build converts high level config into sing-box Options tree, plus the
+// pool/multi-port gateway entry specs (custom listeners replace sing-box inbounds).
+func Build(cfg *config.Config) (option.Options, []poolgateway.EntrySpec, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
 	var failedNodes []string
-	usedTags := make(map[string]int) // Track tag usage for uniqueness
+	usedTags := make(map[string]int)   // Track tag usage for uniqueness
+	tagToIdx := make(map[string]int)   // tag → cfg.Nodes 索引（multi-port 端口自愈回写用）
 
-	for _, node := range cfg.Nodes {
+	for idx, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
 			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
@@ -50,6 +51,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			continue
 		}
 		memberTags = append(memberTags, tag)
+		tagToIdx[tag] = idx
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
 			Name:     node.Name,
@@ -74,7 +76,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Check if we have at least one valid node
 	if len(baseOutbounds) == 0 {
-		return option.Options{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
+		return option.Options{}, nil, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
 	}
 
 	// Log summary
@@ -87,27 +89,21 @@ func Build(cfg *config.Config) (option.Options, error) {
 	printProxyLinks(cfg, metadata)
 
 	var (
-		inbounds  []option.Inbound
 		outbounds = make([]option.Outbound, len(baseOutbounds))
-		route     option.RouteOptions
 	)
 	copy(outbounds, baseOutbounds)
+	var entries []poolgateway.EntrySpec
 
 	// Determine which components to enable based on mode
 	enablePoolInbound := cfg.Mode == "pool" || cfg.Mode == "hybrid"
 	enableMultiPort := cfg.Mode == "multi-port" || cfg.Mode == "hybrid"
 
 	if !enablePoolInbound && !enableMultiPort {
-		return option.Options{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
+		return option.Options{}, nil, fmt.Errorf("unsupported mode %s", cfg.Mode)
 	}
 
-	// Build pool inbound (single entry point for all nodes)
+	// pool 出站 + 网关入口（入口由 poolgateway 自定义 listener 接管，不再用 sing-box inbound）
 	if enablePoolInbound {
-		inbound, err := buildPoolInbound(cfg)
-		if err != nil {
-			return option.Options{}, err
-		}
-		inbounds = append(inbounds, inbound)
 		poolOptions := poolout.Options{
 			Mode:              cfg.Pool.Mode,
 			Members:           memberTags,
@@ -122,15 +118,19 @@ func Build(cfg *config.Config) (option.Options, error) {
 			Tag:     poolout.Tag,
 			Options: &poolOptions,
 		})
-		route.Final = poolout.Tag
+		entries = append(entries, poolgateway.EntrySpec{
+			Tag:            poolout.Tag,
+			Inbound:        "pool",
+			Address:        cfg.Pool.Address,
+			Port:           cfg.Pool.Port,
+			Username:       cfg.Pool.Username,
+			Password:       cfg.Pool.Password,
+			OnPortReassign: func(p uint16) { cfg.Pool.Port = p },
+		})
 	}
 
-	// Build multi-port inbounds (one port per node)
+	// multi-port 出站 + 网关入口（每节点一个入口，端口自愈经 OnPortReassign 回写 cfg.Nodes[idx].Port）
 	if enableMultiPort {
-		addr, err := parseAddr(cfg.MultiPort.Address)
-		if err != nil {
-			return option.Options{}, fmt.Errorf("parse multi-port address: %w", err)
-		}
 		for _, tag := range memberTags {
 			meta := metadata[tag]
 			perMeta := map[string]poolout.MemberMeta{tag: meta}
@@ -142,42 +142,20 @@ func Build(cfg *config.Config) (option.Options, error) {
 				BlacklistDuration: cfg.Pool.BlacklistDuration,
 				Metadata:          perMeta,
 			}
-			perPool := option.Outbound{
+			outbounds = append(outbounds, option.Outbound{
 				Type:    poolout.Type,
 				Tag:     poolTag,
 				Options: &perOptions,
-			}
-			outbounds = append(outbounds, perPool)
-			inboundOptions := &option.HTTPMixedInboundOptions{
-				ListenOptions: option.ListenOptions{
-					Listen:     addr,
-					ListenPort: meta.Port,
-				},
-			}
-			username := cfg.MultiPort.Username
-			password := cfg.MultiPort.Password
-			if username != "" {
-				inboundOptions.Users = []auth.User{{Username: username, Password: password}}
-			}
-			inboundTag := fmt.Sprintf("in-%s", tag)
-			inbounds = append(inbounds, option.Inbound{
-				Type:    C.TypeHTTP,
-				Tag:     inboundTag,
-				Options: inboundOptions,
 			})
-			route.Rules = append(route.Rules, option.Rule{
-				Type: C.RuleTypeDefault,
-				DefaultOptions: option.DefaultRule{
-					RawDefaultRule: option.RawDefaultRule{
-						Inbound: badoption.Listable[string]{inboundTag},
-					},
-					RuleAction: option.RuleAction{
-						Action: C.RuleActionTypeRoute,
-						RouteOptions: option.RouteActionOptions{
-							Outbound: poolTag,
-						},
-					},
-				},
+			nodeIdx := tagToIdx[tag]
+			entries = append(entries, poolgateway.EntrySpec{
+				Tag:            poolTag,
+				Inbound:        "multi-port:" + cfg.Nodes[nodeIdx].Name,
+				Address:        cfg.MultiPort.Address,
+				Port:           meta.Port,
+				Username:       cfg.MultiPort.Username,
+				Password:       cfg.MultiPort.Password,
+				OnPortReassign: func(p uint16) { cfg.Nodes[nodeIdx].Port = p },
 			})
 		}
 	}
@@ -190,36 +168,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	opts := option.Options{
 		Log:       &option.LogOptions{Level: singboxLogLevel},
-		Inbounds:  inbounds,
 		Outbounds: outbounds,
-		Route:     &route,
 	}
-	return opts, nil
-}
-
-func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
-	listenAddr, err := parseAddr(cfg.Pool.Address)
-	if err != nil {
-		return option.Inbound{}, fmt.Errorf("parse listener address: %w", err)
-	}
-	inboundOptions := &option.HTTPMixedInboundOptions{
-		ListenOptions: option.ListenOptions{
-			Listen:     listenAddr,
-			ListenPort: cfg.Pool.Port,
-		},
-	}
-	if cfg.Pool.Username != "" {
-		inboundOptions.Users = []auth.User{{
-			Username: cfg.Pool.Username,
-			Password: cfg.Pool.Password,
-		}}
-	}
-	inbound := option.Inbound{
-		Type:    C.TypeHTTP,
-		Tag:     "http-in",
-		Options: inboundOptions,
-	}
-	return inbound, nil
+	return opts, entries, nil
 }
 
 func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound, error) {
@@ -760,19 +711,6 @@ func hostPort(u *url.URL, defaultPort int) (string, int, error) {
 		return "", 0, fmt.Errorf("invalid port %q", portStr)
 	}
 	return host, port, nil
-}
-
-func parseAddr(value string) (*badoption.Addr, error) {
-	addr := strings.TrimSpace(value)
-	if addr == "" {
-		return nil, nil
-	}
-	parsed, err := netip.ParseAddr(addr)
-	if err != nil {
-		return nil, err
-	}
-	bad := badoption.Addr(parsed)
-	return &bad, nil
 }
 
 func sanitizeTag(name string) string {

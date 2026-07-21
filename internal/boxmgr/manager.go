@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +15,7 @@ import (
 	"easy_proxies/internal/logger"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/poolgateway"
 	"easy_proxies/internal/store"
 
 	"github.com/sagernet/sing-box"
@@ -54,6 +53,7 @@ type Manager struct {
 	mu sync.RWMutex
 
 	currentBox    *box.Box
+	gateway       *poolgateway.Gateway // pool/multi-port 入口自定义 listener（与 currentBox 同生命周期）
 	monitorMgr    *monitor.Manager
 	monitorServer *monitor.Server
 	store         *store.Store // bbolt 存储，ensureMonitor 创建 server 时注入（避免 Start 阻塞导致注入滞后）
@@ -73,6 +73,7 @@ func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager
 	m := &Manager{
 		cfg:        cfg,
 		monitorCfg: monitorCfg,
+		gateway:    poolgateway.New(),
 	}
 	m.applyConfigSettings(cfg)
 	for _, opt := range opts {
@@ -126,28 +127,19 @@ func (m *Manager) Start(ctx context.Context) error {
 	cfg := m.cfg
 	m.mu.Unlock()
 
-	// Try to start, with automatic port conflict resolution
-	var instance *box.Box
-	maxRetries := 10
-	for retry := 0; retry < maxRetries; retry++ {
-		var err error
-		instance, err = m.createBox(ctx, cfg)
-		if err != nil {
-			return err
-		}
-		if err = instance.Start(); err != nil {
-			_ = instance.Close()
-			// Check if it's a port conflict error
-			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
-				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
-				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore() // Reset shared state for rebuild
-					continue
-				}
-			}
-			return fmt.Errorf("start sing-box: %w", err)
-		}
-		break // Success
+	// box 不再绑入口端口（pool/multi-port 入口由 gateway 自定义 listener 接管），
+	// 故无需端口冲突重试循环；端口自愈在 gateway.Start 内完成。
+	instance, entries, err := m.createBox(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if err = instance.Start(); err != nil {
+		_ = instance.Close()
+		return fmt.Errorf("start sing-box: %w", err)
+	}
+	if err = m.gateway.Start(ctx, entries, instance.Outbound()); err != nil {
+		_ = instance.Close()
+		return fmt.Errorf("start pool gateway: %w", err)
 	}
 
 	m.mu.Lock()
@@ -202,6 +194,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
+	// 停旧 gateway（释放入口端口）+ 旧 box，再建新实例。端口冲突自愈在新 gateway.Start 内。
+	if m.gateway.Started() {
+		m.gateway.Stop()
+	}
 	// For multi-port mode, we must close old instance first to release ports
 	// This causes a brief interruption but avoids port conflicts
 	if oldBox != nil {
@@ -216,30 +212,22 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	// Reset shared state store to ensure clean state for new config
 	pool.ResetSharedStateStore()
 
-	// Create and start new box instance with automatic port conflict resolution
-	var instance *box.Box
-	maxRetries := 10
-	for retry := 0; retry < maxRetries; retry++ {
-		var err error
-		instance, err = m.createBox(ctx, newCfg)
-		if err != nil {
-			m.rollbackToOldConfig(ctx, oldCfg)
-			return fmt.Errorf("create new box: %w", err)
-		}
-		if err = instance.Start(); err != nil {
-			_ = instance.Close()
-			// Check if it's a port conflict error
-			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
-				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
-				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore()
-					continue
-				}
-			}
-			m.rollbackToOldConfig(ctx, oldCfg)
-			return fmt.Errorf("start new box: %w", err)
-		}
-		break // Success
+	instance, entries, err := m.createBox(ctx, newCfg)
+	if err != nil {
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("create new box: %w", err)
+	}
+	if err = instance.Start(); err != nil {
+		_ = instance.Close()
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("start new box: %w", err)
+	}
+	// 端口自愈在 gateway.Start 内（经 OnPortReassign 回写 newCfg）；
+	// 须在下方 *m.cfg=*newCfg 拷回之前完成，否则 m.cfg 拿不到修正后的端口。
+	if err = m.gateway.Start(ctx, entries, instance.Outbound()); err != nil {
+		_ = instance.Close()
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("start pool gateway: %w", err)
 	}
 
 	m.applyConfigSettings(newCfg)
@@ -263,7 +251,7 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		return
 	}
 	m.logger.Warnf("attempting rollback to previous config...")
-	instance, err := m.createBox(ctx, oldCfg)
+	instance, entries, err := m.createBox(ctx, oldCfg)
 	if err != nil {
 		m.logger.Errorf("rollback failed to create box: %v", err)
 		return
@@ -271,6 +259,11 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	if err := instance.Start(); err != nil {
 		_ = instance.Close()
 		m.logger.Errorf("rollback failed to start box: %v", err)
+		return
+	}
+	if err := m.gateway.Start(ctx, entries, instance.Outbound()); err != nil {
+		_ = instance.Close()
+		m.logger.Errorf("rollback failed to start gateway: %v", err)
 		return
 	}
 	m.mu.Lock()
@@ -285,6 +278,9 @@ func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.gateway.Started() {
+		m.gateway.Stop()
+	}
 	var err error
 	if m.currentBox != nil {
 		err = m.currentBox.Close()
@@ -318,21 +314,21 @@ func (m *Manager) MonitorServer() *monitor.Server {
 }
 
 // createBox builds a sing-box instance from config.
-func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, []poolgateway.EntrySpec, error) {
 	if cfg == nil {
-		return nil, errors.New("config is nil")
+		return nil, nil, errors.New("config is nil")
 	}
 	if m.monitorMgr == nil {
-		return nil, errors.New("monitor manager not initialized")
+		return nil, nil, errors.New("monitor manager not initialized")
 	}
 
 	// 重置节点注册表：新 box 启动时会重新注册当前节点集合，
 	// 避免删除/变更的节点残留 Snapshot（可用率 Tracker 按 stable_id 保留）。
 	m.monitorMgr.Reset()
 
-	opts, err := builder.Build(cfg)
+	opts, entries, err := builder.Build(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("build sing-box options: %w", err)
+		return nil, nil, fmt.Errorf("build sing-box options: %w", err)
 	}
 
 	inboundRegistry := include.InboundRegistry()
@@ -347,9 +343,9 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 	instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
 	if err != nil {
-		return nil, fmt.Errorf("create sing-box instance: %w", err)
+		return nil, nil, fmt.Errorf("create sing-box instance: %w", err)
 	}
-	return instance, nil
+	return instance, entries, nil
 }
 
 // gracefulSwitch swaps the current box with a new one.
@@ -713,71 +709,7 @@ func (m *Manager) GetCurrentMode() string {
 
 // --- Helper functions ---
 
-// portBindErrorRegex matches "listen tcp4 0.0.0.0:24282: bind: address already in use"
-var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? [^:]+:(\d+): bind: address already in use`)
-
-// extractPortFromBindError extracts the port number from a bind error message.
-func extractPortFromBindError(err error) uint16 {
-	if err == nil {
-		return 0
-	}
-	matches := portBindErrorRegex.FindStringSubmatch(err.Error())
-	if len(matches) < 2 {
-		return 0
-	}
-	var port int
-	fmt.Sscanf(matches[1], "%d", &port)
-	if port > 0 && port <= 65535 {
-		return uint16(port)
-	}
-	return 0
-}
-
-// isPortAvailable checks if a port is available for binding.
-func isPortAvailable(address string, port uint16) bool {
-	addr := fmt.Sprintf("%s:%d", address, port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return false
-	}
-	_ = ln.Close()
-	return true
-}
-
-// reassignConflictingPort finds the node using the conflicting port and assigns a new port.
-func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
-	// Build set of used ports
-	usedPorts := make(map[uint16]bool)
-	if cfg.Mode == "hybrid" {
-		usedPorts[cfg.Pool.Port] = true
-	}
-	for _, node := range cfg.Nodes {
-		usedPorts[node.Port] = true
-	}
-
-	// Find and reassign the conflicting node
-	for idx := range cfg.Nodes {
-		if cfg.Nodes[idx].Port == conflictPort {
-			// Find next available port
-			newPort := conflictPort + 1
-			address := cfg.MultiPort.Address
-			if address == "" {
-				address = "0.0.0.0"
-			}
-			for usedPorts[newPort] || !isPortAvailable(address, newPort) {
-				newPort++
-				if newPort > 65535 {
-					logger.Errorf("No available port found for node %q", cfg.Nodes[idx].Name)
-					return false
-				}
-			}
-			logger.Warnf("Port %d in use, reassigning node %q to port %d", conflictPort, cfg.Nodes[idx].Name, newPort)
-			cfg.Nodes[idx].Port = newPort
-			return true
-		}
-	}
-	return false
-}
+// （端口冲突自愈已迁移至 poolgateway.Gateway.Start：box 不再绑入口端口，端口由自定义 listener 绑定）
 
 func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
 	if len(nodes) == 0 {

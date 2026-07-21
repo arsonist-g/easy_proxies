@@ -4,7 +4,7 @@
 //
 //	availability_rate = (probe_success + call_success) / (probe_total + call_total)
 //
-// 计数走无锁 atomic（ADR-0007），转发路径绝不触碰存储，仅低频管理读取时聚合。
+// 计数走无锁 atomic，转发路径绝不触碰存储，仅低频管理读取时聚合。
 package availability
 
 import (

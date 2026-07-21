@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/logger"
+	"easy_proxies/internal/region"
 
 	"github.com/dlclark/regexp2"
 	"gopkg.in/yaml.v3"
@@ -43,6 +44,9 @@ type Config struct {
 	GeoIP               GeoIPConfig               `yaml:"geoip"`           // 可选本地 MaxMind GeoLite2-ASN，空=禁用
 	VirtualPool         VirtualPoolSettings       `yaml:"virtual_pool"`    // 虚拟池全局设置（端口起点等）
 	CredentialKey       string                    `yaml:"credential_key"`  // 凭证加密密钥（AES-256 hex），解密 db 中密文用；与 db 文件分离
+	GeoCN               GeoCNConfig               `yaml:"geocn"`           // 可选 GeoCN.mmdb 中国 IP 库（访问控制省份/ISP 判定数据源）
+	AccessControl       AccessControlConfig       `yaml:"access_control"`  // 代理入口调用方来源访问控制
+	AccessLog           AccessLogConfig           `yaml:"access_log"`      // 访问日志（内存环形，默认不持久化）
 
 	filePath string `yaml:"-"` // 配置文件路径，用于保存
 
@@ -175,6 +179,34 @@ type GeoIPConfig struct {
 	UpdateInterval time.Duration `yaml:"update_interval"` // 自动更新检查间隔，默认 24h（MaxMind 每周二更新）
 }
 
+// GeoCNConfig GeoCN.mmdb 中国 IP 库配置（访问控制的省份/运营商判定数据源）。
+// GeoCN 仅收录中国 IP，查不到即境外——这正是 access_control.china_only 的判定依据。
+type GeoCNConfig struct {
+	DatabasePath   string        `yaml:"database_path"`    // GeoCN.mmdb 路径（支持挂载自带库）；空=不启用 GeoCN
+	AutoDownload   *bool         `yaml:"auto_download"`    // 是否自动下载/更新到 database 路径；nil=默认 true。false=只读已有文件不下载
+	DownloadURL    string        `yaml:"download_url"`     // 下载地址，默认 GitHub releases/latest 永久直链
+	UpdateInterval time.Duration `yaml:"update_interval"`  // 自动更新间隔，默认 24h（仅 auto_download=true 时生效）
+}
+
+// AccessControlConfig 代理入口调用方来源访问控制配置。
+// 生效方式：WebUI/API 改动热换（atomic.Pointer）立即生效、不断连、不 reload，并持久化到 config.yaml。
+type AccessControlConfig struct {
+	Enabled        bool     `yaml:"enabled"`         // 是否启用（关闭则全部放行）
+	AllowIPs       []string `yaml:"allow_ips"`       // CIDR 白名单（最高优先级，用于服务器到服务器代理）
+	ChinaOnly      bool     `yaml:"china_only"`      // 仅允许中国 IP（查不到 GeoCN 记录即境外）
+	AllowProvinces []string `yaml:"allow_provinces"` // 省份白名单（标准名/全称/简称/码均可，加载时归一+校验）
+	AllowISPs      []string `yaml:"allow_isps"`      // 允许的运营商（电信/联通/移动/广电/教育网）
+	BlockIDC       bool     `yaml:"block_idc"`       // 拒绝机房/数据中心 IP（GeoCN type 含 IDC）
+	UnknownISP     string   `yaml:"unknown_isp"`     // 未知 ISP 处理：deny/allow（默认 deny）
+}
+
+// AccessLogConfig 访问日志配置（内存环形缓冲，转发路径不触达 store）。
+type AccessLogConfig struct {
+	Enabled  bool `yaml:"enabled"`  // 是否记录访问日志
+	Capacity int  `yaml:"capacity"` // 内存环形缓冲容量，默认 10000
+	Persist  bool `yaml:"persist"`  // 是否持久化到 bbolt（默认关闭）
+}
+
 // NodeSource indicates where a node configuration originated from.
 type NodeSource string
 
@@ -245,6 +277,10 @@ func Load(path string) (*Config, error) {
 	// Resolve geoip.asn_database path relative to config file directory
 	if cfg.GeoIP.ASNDatabase != "" && !filepath.IsAbs(cfg.GeoIP.ASNDatabase) {
 		cfg.GeoIP.ASNDatabase = filepath.Join(filepath.Dir(path), cfg.GeoIP.ASNDatabase)
+	}
+	// Resolve geocn.database_path relative to config file directory
+	if cfg.GeoCN.DatabasePath != "" && !filepath.IsAbs(cfg.GeoCN.DatabasePath) {
+		cfg.GeoCN.DatabasePath = filepath.Join(filepath.Dir(path), cfg.GeoCN.DatabasePath)
 	}
 
 	if err := cfg.normalize(); err != nil {
@@ -488,6 +524,11 @@ func (c *Config) normalize() error {
 
 	// 验证虚拟池配置
 	if err := c.validateVirtualPools(); err != nil {
+		return err
+	}
+
+	// 验证访问控制（省份归一+unknown_isp）与 geocn/accesslog 默认值
+	if err := c.validateAccessControl(); err != nil {
 		return err
 	}
 
@@ -1505,5 +1546,80 @@ func (c *Config) validateVirtualPools() error {
 		}
 	}
 
+	return nil
+}
+
+// validateAccessControl 归一化并校验 access_control 段，并填充 geocn/accesslog 默认值。
+// 省份白名单：把标准名/全称/简称/码统一归一为标准名；无法识别的省返回 *ValidationError
+// （→422），不静默失败——这正是用户要求"填错省份启动报错"的实现。
+func (c *Config) validateAccessControl() error {
+	if c.GeoCN.AutoDownload == nil {
+		t := true
+		c.GeoCN.AutoDownload = &t
+	}
+	if c.GeoCN.UpdateInterval <= 0 {
+		c.GeoCN.UpdateInterval = 24 * time.Hour
+	}
+	if c.AccessLog.Capacity <= 0 {
+		c.AccessLog.Capacity = 10000
+	}
+	// unknown_isp 归一：空默认 deny，非空须为 deny/allow
+	switch strings.ToLower(strings.TrimSpace(c.AccessControl.UnknownISP)) {
+	case "", "deny":
+		c.AccessControl.UnknownISP = "deny"
+	case "allow":
+		c.AccessControl.UnknownISP = "allow"
+	default:
+		return &ValidationError{Msg: fmt.Sprintf("access_control.unknown_isp %q 无效（用 deny 或 allow）", c.AccessControl.UnknownISP)}
+	}
+	// 省份白名单归一 + 去重；无法识别立即报错
+	if len(c.AccessControl.AllowProvinces) > 0 {
+		normalized := make([]string, 0, len(c.AccessControl.AllowProvinces))
+		seen := make(map[string]bool, len(c.AccessControl.AllowProvinces))
+		for _, p := range c.AccessControl.AllowProvinces {
+			std, ok := region.Normalize(p)
+			if !ok {
+				return &ValidationError{Msg: fmt.Sprintf("access_control.allow_provinces %q 无法识别（用标准省名/简称/行政区划码，如 广西/桂/450000）", p)}
+			}
+			if !seen[std] {
+				seen[std] = true
+				normalized = append(normalized, std)
+			}
+		}
+		c.AccessControl.AllowProvinces = normalized
+	}
+	return nil
+}
+
+// SaveAccessControl 持久化 access_control 段到 config.yaml（读原文件保留其他段，仅替换 access_control）。
+// 供访问控制 API 回写，使 WebUI 改动的策略落盘可被用户二次编辑。省份名已归一为标准名。
+func (c *Config) SaveAccessControl() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
+
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var saveCfg Config
+	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	saveCfg.AccessControl = c.AccessControl
+
+	newData, err := yaml.Marshal(&saveCfg)
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := os.WriteFile(c.filePath, newData, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
 	return nil
 }

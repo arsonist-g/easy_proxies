@@ -96,7 +96,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 // handleSettingsPut PUT /api/v1/settings（external_ip/skip_cert_verify/alert_enabled；不含 probe_target）
 func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ExternalIP        string  `json:"external_ip"`
+		ExternalIP        *string `json:"external_ip"`          // 指针：nil = 保留（支持各卡片独立保存，不互相覆盖）
 		SkipCertVerify    *bool   `json:"skip_cert_verify"` // 指针：nil = 保留现有值（修复未提供时被重置为 false）
 		AlertEnabled      *bool   `json:"alert_enabled"`
 		PoolUsername      *string `json:"pool_username"`       // 代理池入口（pool/hybrid 的 listener）用户名，nil=保留
@@ -109,13 +109,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// probe_target 不在 settings 暴露：保留现有值（运行时国家探测固定走 cdn-cgi/trace）
-	// skip_cert_verify 未提供时同样保留现有值（避免 bool 零值 false 覆盖）
-	_, probe, curSkip := s.getSettings()
+	// external_ip / skip_cert_verify 未提供时同样保留现有值（支持各卡片独立保存，避免零值覆盖）
+	curIP, probe, curSkip := s.getSettings()
+	newIP := curIP
+	if req.ExternalIP != nil {
+		newIP = *req.ExternalIP
+	}
 	newSkip := curSkip
 	if req.SkipCertVerify != nil {
 		newSkip = *req.SkipCertVerify
 	}
-	if err := s.updateSettings(req.ExternalIP, probe, newSkip); err != nil {
+	if err := s.updateSettings(newIP, probe, newSkip); err != nil {
 		respondError(w, r, http.StatusInternalServerError, CodeInternalError, err.Error())
 		return
 	}

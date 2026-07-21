@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/accesscontrol"
+	"easy_proxies/internal/accesslog"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/logger"
 	"easy_proxies/internal/monitor"
@@ -275,6 +277,20 @@ func (p *VirtualPool) selectNode(nodes []monitor.Snapshot) *monitor.Snapshot {
 // handleConnection 处理客户端连接
 func (p *VirtualPool) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
+
+	// 访问控制：按调用方源 IP 多层过滤（固定IP白名单>仅中国>省份>ISP/IDC）。
+	// 拒绝则直接关闭、不读请求、不回响应——信息最少，不向探测者暴露"这是受访问控制的代理"。
+	srcAddr := clientConn.RemoteAddr()
+	srcIP := srcAddr.String()
+	if h, _, err := net.SplitHostPort(srcIP); err == nil {
+		srcIP = h
+	}
+	decision := accesscontrol.Check(srcIP)
+	accesslog.Record(decision.Allowed, srcIP, decision.Reason, decision.Info.Province,
+		decision.Info.ISP, decision.Info.NetType, "", "virtual-pool:"+p.cfg.Name)
+	if !decision.Allowed {
+		return
+	}
 
 	// 设置读取超时
 	clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))

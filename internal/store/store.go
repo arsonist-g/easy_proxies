@@ -1,6 +1,6 @@
 // Package store 封装 bbolt KV 存储，管理低频管理数据
 //（订阅 / API Key / 订阅 token / 节点探测结果）。
-// 代理转发路径不触达本包（ADR-0007：转发只走 sing-box + 内存 atomic 计数）。
+// 代理转发路径不触达本包（转发只走 sing-box + 内存 atomic 计数）。
 package store
 
 import (

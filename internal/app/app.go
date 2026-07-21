@@ -8,8 +8,11 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"easy_proxies/internal/accesscontrol"
+	"easy_proxies/internal/accesslog"
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geocn"
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/logger"
 	"easy_proxies/internal/monitor"
@@ -80,6 +83,59 @@ func Run(ctx context.Context, cfg *config.Config) error {
 				Interval:   cfg.GeoIP.UpdateInterval,
 			})
 		}
+	}
+
+	// 可选：打开 GeoCN.mmdb（访问控制的省份/运营商判定数据源）。
+	// database 路径空 = 不启用 GeoCN（访问控制退化为仅 IP 白名单）。
+	// database 非空 + auto_download=true → 文件缺失则后台自动下载（GitHub 免认证直链）并周期更新，下载完热加载。
+	// database 非空 + auto_download=false → 只读已有文件不下载（适合挂载自带库；文件缺失则 GeoCN 不就绪）。
+	autoDL := cfg.GeoCN.AutoDownload != nil && *cfg.GeoCN.AutoDownload
+	if geocnDB := cfg.GeoCN.DatabasePath; geocnDB != "" {
+		defer geocn.Close()
+		if err := geocn.Open(geocnDB); err != nil {
+			if autoDL {
+				logger.Warnf("GeoCN 打开 %s 失败: %v（后台将自动下载）", geocnDB, err)
+			} else {
+				logger.Warnf("GeoCN 打开 %s 失败: %v（auto_download=false，请确认 mmdb 文件已就位）", geocnDB, err)
+			}
+		} else {
+			logger.Infof("GeoCN database loaded: %s", geocnDB)
+		}
+		if autoDL {
+			go geocn.RunUpdater(ctx, geocn.UpdaterConfig{
+				DestPath: geocnDB,
+				URL:      cfg.GeoCN.DownloadURL,
+				Interval: cfg.GeoCN.UpdateInterval,
+			})
+		}
+	} else if cfg.AccessControl.Enabled {
+		logger.Warnf("⚠️ 访问控制已启用但未配置 geocn.database_path：省份/ISP/仅中国判定不可用，仅 IP 白名单将生效")
+	}
+
+	// 访问控制：从配置构造策略并热换加载（atomic.Pointer，运行时 Check 无锁读）。
+	// 省份名已在 config.normalize 阶段归一为标准名；非法 CIDR 在此报错（启动失败，避免错误策略静默生效）。
+	policy, err := accesscontrol.Build(accesscontrol.Options{
+		Enabled:        cfg.AccessControl.Enabled,
+		AllowIPs:       cfg.AccessControl.AllowIPs,
+		ChinaOnly:      cfg.AccessControl.ChinaOnly,
+		AllowProvinces: cfg.AccessControl.AllowProvinces,
+		AllowISPs:      cfg.AccessControl.AllowISPs,
+		BlockIDC:       cfg.AccessControl.BlockIDC,
+		UnknownISP:     cfg.AccessControl.UnknownISP,
+	})
+	if err != nil {
+		return fmt.Errorf("build access control policy: %w", err)
+	}
+	accesscontrol.Set(policy)
+	if cfg.AccessControl.Enabled {
+		logger.Infof("🛡️ 访问控制已启用（china_only=%v, allow_provinces=%v, allow_isps=%v, block_idc=%v）",
+			cfg.AccessControl.ChinaOnly, cfg.AccessControl.AllowProvinces, cfg.AccessControl.AllowISPs, cfg.AccessControl.BlockIDC)
+	}
+
+	// 访问日志：内存环形缓冲（转发路径不触达 store；重启后清空）。
+	if cfg.AccessLog.Enabled {
+		accesslog.SetDefault(accesslog.New(cfg.AccessLog.Capacity))
+		logger.Infof("📝 访问日志已启用（容量 %d，内存环形）", cfg.AccessLog.Capacity)
 	}
 
 	// 同步 config.yaml 与 bbolt 订阅定义：yaml 为权威源，bbolt 保留运行时状态。

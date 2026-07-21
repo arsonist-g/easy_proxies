@@ -32,7 +32,7 @@ func newRouter(s *Server) http.Handler {
 		r.Get("/", s.serveHTML("index"))
 	}
 	// 各功能页（pjax + 真 URL）：canonical 无后缀（/alerts），保留 .html 兼容旧书签/直链
-	for _, pg := range []string{"dashboard", "nodes", "subs", "pools", "creds", "alerts", "settings"} {
+	for _, pg := range []string{"dashboard", "nodes", "subs", "pools", "creds", "alerts", "access_log", "settings"} {
 		r.Get(prefix+"/"+pg, s.serveHTML(pg))
 		r.Get(prefix+"/"+pg+".html", s.serveHTML(pg))
 	}
@@ -106,6 +106,11 @@ func newRouter(s *Server) http.Handler {
 			r.Get("/export", s.handleExport)
 			r.Get("/settings", s.handleSettingsGet)
 			r.Put("/settings", s.handleSettingsPut)
+
+			// 访问控制（热换生效，不 reload）/ 访问日志
+			r.Get("/access-control", s.handleAccessControlGet)
+			r.Put("/access-control", s.handleAccessControlPut)
+			r.Get("/access-logs", s.handleAccessLogsList)
 		})
 	})
 
