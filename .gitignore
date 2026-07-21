@@ -35,6 +35,9 @@ coverage.html
 # Local test sandbox (config/nodes.txt/easy.db/logs for runtime testing)
 /run/
 
+# Docker 运行时数据目录（config.yaml / nodes.txt / easy.db 集中挂载）
+/data/
+
 # Qodo
 .qodo/
 CLAUDE.md

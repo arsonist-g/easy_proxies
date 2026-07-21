@@ -1,37 +1,8 @@
 services:
-  # ──────────────────────────────────────────────────────────────
-  # 一次性初始化容器：在主容器启动前确保 nodes.txt / easy.db 以
-  # "文件"形式存在于宿主机。
-  # 原因：Docker 对"不存在的宿主机路径"做单文件 bind mount 时会自动
-  # 把它创建为目录，导致容器内对应路径变成目录而启动失败
-  # （bbolt 无法把目录当数据库文件打开；应用层 store.Open 也会兜底）。
-  # 复用主镜像（无需额外镜像/版本），以 root 运行一次后退出。
-  # ──────────────────────────────────────────────────────────────
-  ensure-files:
-    image: ghcr.io/arsonist-g/easy_proxies:latest
-    container_name: easy-proxies-ensure-files
-    user: "0:0"
-    restart: "no"
-    volumes:
-      - ./:/work
-    working_dir: /work
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        for f in nodes.txt easy.db; do
-          if [ -d "$$f" ]; then rm -rf "$$f"; fi
-          if [ ! -e "$$f" ]; then touch "$$f"; fi
-          chmod 666 "$$f" || true
-        done
-        echo "ensure-files: nodes.txt / easy.db ready"
-
   easy-proxies:
     image: ghcr.io/arsonist-g/easy_proxies:latest
     container_name: easy-proxies
     restart: unless-stopped
-    depends_on:
-      ensure-files:
-        condition: service_completed_successfully
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）
     network_mode: host
     # 方式二：手动映射端口（注释掉 network_mode，启用下面的 ports）
@@ -54,11 +25,15 @@ services:
     #   - 节点状态在两种入口间共享（黑名单同步）
     #   - 端口冲突时自动重分配到下一个可用端口
     volumes:
-      # 配置文件需要可写权限以支持 WebUI 设置保存
-      # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt
-      - ./config.yaml:/etc/easy-proxies/config.yaml
-      - ./nodes.txt:/etc/easy-proxies/nodes.txt
-      # bbolt 存储文件（订阅/API Key/订阅token/探测结果持久化）
-      # 由上方 ensure-files 容器在启动前自动创建为空文件（避免 Docker 把
-      # 缺失的单文件 bind mount 创建成目录）；应用层 store.Open 亦会兜底。
-      - ./easy.db:/etc/easy-proxies/easy.db
+      # 运行时数据目录：config.yaml / nodes.txt / easy.db 全部集中于此，与源码隔离。
+      # 整个"目录"挂载（而非单文件挂载），彻底避免 Docker 把缺失的单文件 bind mount
+      # 创建成目录的问题；easy.db 由程序首次启动自动创建（store.Open）。
+      #
+      # 首次部署：
+      #   mkdir -p data
+      #   cp config.example.yaml data/config.yaml   # 然后编辑 data/config.yaml
+      # 容器以 uid 10001 运行，需对 data/ 有写权限（建 easy.db / 保存设置）：
+      #   chmod -R 777 data
+      #
+      # data/ 已在 .gitignore。若要放到仓库外，把下方左侧 ./data 改成绝对路径或 ../xxx。
+      - ./data:/etc/easy-proxies
