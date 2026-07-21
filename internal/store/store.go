@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	bbolt "github.com/sagernet/bbolt"
@@ -44,6 +46,9 @@ type Store struct {
 
 // Open 打开/创建 bbolt 文件并确保所有桶存在。
 func Open(path string) (*Store, error) {
+	if err := ensureDBFile(path); err != nil {
+		return nil, err
+	}
 	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: 3 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open bbolt %s: %w", path, err)
@@ -54,6 +59,30 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// ensureDBFile 保证 bbolt 文件路径可用：缺失时交由 bbolt.Open 创建空文件；
+// 若路径被误当目录（Docker 单文件 bind mount 在宿主机文件缺失时会创建目录的典型现象），
+// 能清理则清理后由 bbolt 重建；活动的 bind mount 目录无法移除时返回明确指引。
+func ensureDBFile(path string) error {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create bbolt dir %s: %w", dir, err)
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 不存在，bbolt.Open 会自动创建空文件
+		}
+		return fmt.Errorf("stat bbolt %s: %w", path, err)
+	}
+	if info.IsDir() {
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("bbolt path %s 当前是目录且无法移除（常见于 Docker 把缺失的宿主机文件 bind mount 成目录）；请在宿主机清理后重试: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // Close 关闭底层 bbolt。

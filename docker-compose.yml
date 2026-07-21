@@ -1,8 +1,37 @@
 services:
+  # ──────────────────────────────────────────────────────────────
+  # 一次性初始化容器：在主容器启动前确保 nodes.txt / easy.db 以
+  # "文件"形式存在于宿主机。
+  # 原因：Docker 对"不存在的宿主机路径"做单文件 bind mount 时会自动
+  # 把它创建为目录，导致容器内对应路径变成目录而启动失败
+  # （bbolt 无法把目录当数据库文件打开；应用层 store.Open 也会兜底）。
+  # 复用主镜像（无需额外镜像/版本），以 root 运行一次后退出。
+  # ──────────────────────────────────────────────────────────────
+  ensure-files:
+    image: ghcr.io/arsonist-g/easy_proxies:latest
+    container_name: easy-proxies-ensure-files
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - ./:/work
+    working_dir: /work
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for f in nodes.txt easy.db; do
+          if [ -d "$$f" ]; then rm -rf "$$f"; fi
+          if [ ! -e "$$f" ]; then touch "$$f"; fi
+          chmod 666 "$$f" || true
+        done
+        echo "ensure-files: nodes.txt / easy.db ready"
+
   easy-proxies:
     image: ghcr.io/arsonist-g/easy_proxies:latest
     container_name: easy-proxies
     restart: unless-stopped
+    depends_on:
+      ensure-files:
+        condition: service_completed_successfully
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）
     network_mode: host
     # 方式二：手动映射端口（注释掉 network_mode，启用下面的 ports）
@@ -30,6 +59,6 @@ services:
       - ./config.yaml:/etc/easy-proxies/config.yaml
       - ./nodes.txt:/etc/easy-proxies/nodes.txt
       # bbolt 存储文件（订阅/API Key/订阅token/探测结果持久化）
-      # 注意：首次部署前需在宿主机执行 `touch easy.db` 创建空文件，
-      # 否则 Docker 单文件 bind mount 会将其创建为目录导致启动失败
+      # 由上方 ensure-files 容器在启动前自动创建为空文件（避免 Docker 把
+      # 缺失的单文件 bind mount 创建成目录）；应用层 store.Open 亦会兜底。
       - ./easy.db:/etc/easy-proxies/easy.db
