@@ -12,6 +12,7 @@ package geocn
 import (
 	"fmt"
 	"net/netip"
+	"strconv"
 	"sync"
 
 	"github.com/oschwald/maxminddb-golang/v2"
@@ -23,8 +24,10 @@ var (
 )
 
 // geoCNRecord 对应 GeoCN.mmdb 的记录结构(平铺三字段)。
+// 注意:division_code 在库中是数值类型(uint64,国标 6 位行政区划码),必须用数值类型
+// 接收;若用 string,maxminddb 解码会因类型不匹配失败,Lookup 把所有中国 IP 误判境外。
 type geoCNRecord struct {
-	DivisionCode string `maxminddb:"division_code"`
+	DivisionCode uint64 `maxminddb:"division_code"`
 	ISP          string `maxminddb:"isp"`
 	NetType      string `maxminddb:"type"`
 }
@@ -60,6 +63,7 @@ func Close() {
 
 // Lookup 查询 ip 的行政区划码/运营商/网络类型。
 // 未配置 db / 解析失败 / 无记录均返回 ok=false(GeoCN 中无记录=境外 IP)。
+// divisionCode 返回国标 6 位码的字符串形式(如 "451022"),供 ProvinceByCode 取前 2 位归一为省名。
 func Lookup(ip string) (divisionCode, isp, netType string, ok bool) {
 	mu.RLock()
 	r := reader
@@ -75,10 +79,10 @@ func Lookup(ip string) (divisionCode, isp, netType string, ok bool) {
 	if err := r.Lookup(addr).Decode(&rec); err != nil {
 		return "", "", "", false
 	}
-	if rec.DivisionCode == "" && rec.ISP == "" && rec.NetType == "" {
+	if rec.DivisionCode == 0 && rec.ISP == "" && rec.NetType == "" {
 		return "", "", "", false
 	}
-	return rec.DivisionCode, rec.ISP, rec.NetType, true
+	return strconv.FormatUint(rec.DivisionCode, 10), rec.ISP, rec.NetType, true
 }
 
 // Loaded 报告当前是否已加载可用库(供装配阶段判断是否就绪)。
