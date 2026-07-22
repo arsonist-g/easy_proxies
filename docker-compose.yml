@@ -32,8 +32,7 @@ services:
       # 首次部署：
       #   mkdir -p data
       #   cp config.example.yaml data/config.yaml   # 然后编辑 data/config.yaml
-      # 容器以 uid 10001 运行，需对 data/ 有写权限（建 easy.db / 保存设置）：
-      #   chmod -R 777 data
+      # 容器以 root 运行，data/ 无需额外授权即可写入。
       #
       # data/ 已在 .gitignore。若要放到仓库外，把下方左侧 ./data 改成绝对路径或 ../xxx。
       - ./data:/etc/easy-proxies
