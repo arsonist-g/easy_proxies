@@ -138,7 +138,11 @@ func (p *Policy) Check(srcIP string) Decision {
 	if len(p.AllowISPs) > 0 {
 		if info.ISP != "" {
 			if containsString(p.AllowISPs, info.ISP) {
-				return Decision{Allowed: true, Reason: "命中运营商白名单: " + info.ISP, Info: info}
+				reason := "命中运营商: " + info.ISP
+				if len(p.AllowProvinces) > 0 {
+					reason = "命中省份+运营商: " + info.Province + "/" + info.ISP
+				}
+				return Decision{Allowed: true, Reason: reason, Info: info}
 			}
 			return Decision{Allowed: false, Reason: "运营商不在白名单: " + info.ISP, Info: info}
 		}
@@ -150,7 +154,11 @@ func (p *Policy) Check(srcIP string) Decision {
 	}
 
 	// 6. 未配运营商白名单:省份/IDC 已检过,放行
-	return Decision{Allowed: true, Reason: "通过", Info: info}
+	reason := "通过"
+	if len(p.AllowProvinces) > 0 {
+		reason = "命中省份: " + info.Province
+	}
+	return Decision{Allowed: true, Reason: reason, Info: info}
 }
 
 // geoLookup 把 IP 查询为 GeoInfo。默认走 GeoCN;测试可替换以注入固定判定。

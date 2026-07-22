@@ -1,6 +1,7 @@
 package accesscontrol
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -134,4 +135,18 @@ func TestSetGetGlobal(t *testing.T) {
 		t.Error("Set/Get 不一致")
 	}
 	Set(nil) // 清理,避免污染其他测试
+}
+
+// TestAllowReasonShowsProvinceAndISP 验证放行原因在省份+运营商都命中时写全
+// （修复"只写运营商、漏省份"的日志不清问题）。
+func TestAllowReasonShowsProvinceAndISP(t *testing.T) {
+	withGeo(t, func(string) GeoInfo { return GeoInfo{IsChina: true, Province: "广西", ISP: "移动"} })
+	p, _ := Build(Options{Enabled: true, ChinaOnly: true, AllowProvinces: []string{"广西"}, AllowISPs: []string{"移动"}})
+	d := p.Check("1.2.3.4")
+	if !d.Allowed {
+		t.Fatalf("应放行: %s", d.Reason)
+	}
+	if !strings.Contains(d.Reason, "广西") || !strings.Contains(d.Reason, "移动") {
+		t.Errorf("放行原因应同时含省份和运营商, got %q", d.Reason)
+	}
 }
