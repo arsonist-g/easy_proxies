@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -278,4 +279,188 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 // 前端触发 /probe/all 后轮询此端点，展示 x/y 进度，running=false 提示本轮完成。
 func (s *Server) handleProbeProgress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.mgr.Progress())
+}
+
+// pickedProxy GET /api/v1/nodes/pick 返回的单个代理地址对象。
+// host 为外部访问地址，port/username/password 为该节点直接 multi_port 端口凭证。
+type pickedProxy struct {
+	Name             string  `json:"name"`
+	ExitIP           string  `json:"exit_ip,omitempty"`
+	Host             string  `json:"host"`
+	Port             uint16  `json:"port"`
+	Username         string  `json:"username,omitempty"`
+	Password         string  `json:"password,omitempty"`
+	Protocol         string  `json:"protocol"`
+	CountryCode      string  `json:"country_code,omitempty"`
+	CountryName      string  `json:"country_name,omitempty"`
+	LatencyMs        int64   `json:"latency_ms,omitempty"`
+	AvailabilityRate float64 `json:"availability_rate,omitempty"`
+}
+
+// handleNodePick GET /api/v1/nodes/pick：按策略从候选节点选一个，返回其直接 multi_port 地址。
+// 用于单次会话内固定出口 IP 的场景（如批量注册）。候选集为空返回 404。
+// round_robin 按调用方 + 过滤规则组合的游标轮询（进程内存，重启归零）。
+func (s *Server) handleNodePick(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	cands := filterForPick(s.mgr.Snapshot(), q)
+	if len(cands) == 0 {
+		respondAPIError(w, r, errNotFoundAPI)
+		return
+	}
+
+	strategy := strings.TrimSpace(q.Get("strategy"))
+	if strategy == "" {
+		strategy = "round_robin"
+	}
+
+	// round_robin 游标粒度：调用方标识 + 过滤规则组合
+	cursorKey := ""
+	if strategy == "round_robin" {
+		cursorKey = pickCallerID(authFromContext(r)) + "|" + pickRuleKey(q)
+	}
+
+	sn := s.pickNode(cands, strategy, cursorKey)
+
+	externalIP, _, _ := s.getSettings()
+	host := externalIP
+	if host == "" {
+		host = hostFromListen(sn.ListenAddress)
+	}
+	writeJSON(w, pickedProxy{
+		Name:             sn.Name,
+		ExitIP:           sn.ExitIP,
+		Host:             host,
+		Port:             sn.Port,
+		Username:         sn.Username,
+		Password:         sn.Password,
+		Protocol:         "http",
+		CountryCode:      sn.CountryCode,
+		CountryName:      sn.CountryName,
+		LatencyMs:        sn.LastLatencyMs,
+		AvailabilityRate: sn.AvailabilityRate,
+	})
+}
+
+// pickCallerID 从鉴权信息生成调用方标识（round_robin 游标粒度之一）。
+// apikey 用 Key ID 区分；session（单 token 模型）与无密码模式各自归并为一类。
+func pickCallerID(info *authInfo) string {
+	if info == nil || info.Method == "" {
+		return "anon"
+	}
+	if info.Method == "apikey" {
+		return fmt.Sprintf("apikey:%d", info.APIKeyID)
+	}
+	return info.Method // session / none
+}
+
+// pickRuleKey 把过滤参数规范成稳定串，参与 round_robin 游标键：
+// 同一调用方 + 同一规则共享游标，规则变化（如换 country）即开新游标。
+func pickRuleKey(q url.Values) string {
+	return "name_regex=" + q.Get("name_regex") +
+		"&exit_ip=" + q.Get("exit_ip") +
+		"&country=" + q.Get("country") +
+		"&protocol=" + q.Get("protocol") +
+		"&available=" + q.Get("available")
+}
+
+// filterForPick 按 /nodes/pick 的 query 参数过滤候选节点。
+// 与 /nodes 的 filterNodes 差异：country 支持逗号分隔多值、exit_ip 严格相等过滤、available 默认 true。
+func filterForPick(nodes []Snapshot, q url.Values) []Snapshot {
+	nameRegex := strings.TrimSpace(q.Get("name_regex"))
+	exitIP := strings.TrimSpace(q.Get("exit_ip"))
+	country := strings.TrimSpace(q.Get("country"))
+	protocol := strings.TrimSpace(q.Get("protocol"))
+	available := q.Get("available")
+
+	// available 默认 true，仅显式 false/0 关闭
+	availOnly := !(available == "false" || available == "0")
+
+	var re *regexp.Regexp
+	if nameRegex != "" {
+		if compiled, err := regexp.Compile(nameRegex); err == nil {
+			re = compiled
+		}
+	}
+
+	var countries []string
+	if country != "" {
+		for _, c := range strings.Split(country, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				countries = append(countries, c)
+			}
+		}
+	}
+
+	out := make([]Snapshot, 0, len(nodes))
+	for _, n := range nodes {
+		if exitIP != "" && n.ExitIP != exitIP {
+			continue
+		}
+		if len(countries) > 0 && !containsFold(countries, n.CountryCode) {
+			continue
+		}
+		if protocol != "" && !strings.EqualFold(protocol, n.Mode) {
+			continue
+		}
+		if availOnly && !(n.InitialCheckDone && n.Available) {
+			continue
+		}
+		if re != nil && !re.MatchString(n.Name) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// pickNode 按 strategy 从候选集选一个节点。
+//   round_robin：候选集按 stable_id 稳定排序后，按游标轮询。
+//   availability_first：可用率降序、延迟升序（未知沉底）、名称升序，确定性取第一。
+//   weighted：按可用率/延迟综合得分加权随机（等权，复用 PickWeighted 语义）。
+func (s *Server) pickNode(cands []Snapshot, strategy, cursorKey string) Snapshot {
+	switch strategy {
+	case "availability_first":
+		sorted := make([]Snapshot, len(cands))
+		copy(sorted, cands)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i].AvailabilityRate != sorted[j].AvailabilityRate {
+				return sorted[i].AvailabilityRate > sorted[j].AvailabilityRate
+			}
+			ai, bi := sorted[i].LastLatencyMs < 0, sorted[j].LastLatencyMs < 0
+			if ai && bi {
+				return sorted[i].Name < sorted[j].Name
+			}
+			if ai {
+				return false
+			}
+			if bi {
+				return true
+			}
+			if sorted[i].LastLatencyMs != sorted[j].LastLatencyMs {
+				return sorted[i].LastLatencyMs < sorted[j].LastLatencyMs
+			}
+			return sorted[i].Name < sorted[j].Name
+		})
+		return sorted[0]
+	case "weighted":
+		scores := make([]float64, len(cands))
+		for i, n := range cands {
+			scores[i] = WeightedScore(n.LastLatencyMs, n.AvailabilityRate, n.TotalAttempts, 1, 1)
+		}
+		s.pickCursorsMu.Lock()
+		idx := PickWeighted(scores, s.pickRng)
+		s.pickCursorsMu.Unlock()
+		return cands[idx]
+	default: // round_robin
+		sorted := make([]Snapshot, len(cands))
+		copy(sorted, cands)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			return sorted[i].StableID < sorted[j].StableID
+		})
+		s.pickCursorsMu.Lock()
+		n := s.pickCursors[cursorKey]
+		s.pickCursors[cursorKey] = n + 1
+		s.pickCursorsMu.Unlock()
+		return sorted[n%len(sorted)]
+	}
 }

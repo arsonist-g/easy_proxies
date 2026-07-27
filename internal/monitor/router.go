@@ -62,6 +62,7 @@ func newRouter(s *Server) http.Handler {
 
 			// 节点
 			r.Get("/nodes", s.handleNodesList)
+			r.Get("/nodes/pick", s.handleNodePick)
 			r.Get("/nodes/{stable_id}", s.handleNodeGet)
 			r.Post("/nodes", s.handleNodeCreate)
 			r.Patch("/nodes/{stable_id}", s.handleNodeUpdate)

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io/fs"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -101,6 +102,12 @@ type Server struct {
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
 	vpMgr        VirtualPoolManager
+
+	// /nodes/pick 的 round_robin 游标与 weighted 随机源（进程内存，重启归零）。
+	// pickCursorsMu 同时保护 pickCursors 与 pickRng。
+	pickCursors   map[string]int
+	pickCursorsMu sync.Mutex
+	pickRng       *mrand.Rand
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -112,6 +119,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		logger = log.Default()
 	}
 	s := &Server{cfg: cfg, mgr: mgr, logger: logger}
+	s.pickCursors = make(map[string]int)
+	s.pickRng = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 
 	// 生成随机 session token（重启失效）
 	tokenBytes := make([]byte, 32)
