@@ -21,6 +21,7 @@ type proxyListItem struct {
 	Protocol         string  `json:"protocol"`
 	LatencyMs        int64   `json:"latency_ms,omitempty"`
 	AvailabilityRate float64 `json:"availability_rate,omitempty"`
+	ExitIP           string  `json:"exit_ip,omitempty"`
 }
 
 // handleProxyList GET /sub/{token}：JSON 代理列表（订阅 token 已由 subTokenAuth 校验）。
@@ -60,6 +61,7 @@ func (s *Server) handleProxyList(w http.ResponseWriter, r *http.Request) {
 			Protocol:         "http",
 			LatencyMs:        sn.LastLatencyMs,
 			AvailabilityRate: sn.AvailabilityRate,
+			ExitIP:           sn.ExitIP,
 		})
 	}
 
