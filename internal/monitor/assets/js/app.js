@@ -230,18 +230,23 @@ function copyLink(elId, msg){
   const el = document.getElementById(elId);
   if(el) copyText(el.value, msg||'链接已复制');
 }
-// copyNodeProxy 拼节点端口代理链接 http://user:pwd@external_ip:port（点击时按需加载 settings）
-async function copyNodeProxy(port){
+// nodeProxyUrl 拼单个节点端口代理链接 http://user:pwd@external_ip:port，返回 {url} 或 {reason}。
+// pool 模式节点共享 listener 端口（节点 port 是分配位次，非监听口）→ 用 listener_port；
+// port=0（未分配）同样回退 listener_port。hybrid/multi-port 用节点独立端口。
+async function nodeProxyUrl(port){
   if(!EP.settings.external_ip) await loadAppSettings();
   const s = EP.settings;
-  if(!s.external_ip){ toast('未获取到 external_ip，请稍后再试','warn'); return; }
-  if(!s.proxy_username && !s.proxy_password){ toast('当前模式无统一代理凭证，无法生成链接','warn'); return; }
-  // pool 模式节点共享 listener 端口（节点 port 是分配位次，非监听口）→ 用 listener_port；
-  // port=0（未分配）同样回退 listener_port。hybrid/multi-port 用节点独立端口。
+  if(!s.external_ip) return { reason:'未获取到 external_ip，请稍后再试' };
+  if(!s.proxy_username && !s.proxy_password) return { reason:'当前模式无统一代理凭证，无法生成链接' };
   const eff = (s.mode === 'pool' || !port) ? s.listener_port : port;
-  if(!eff){ toast('未获取到监听端口，请稍后再试','warn'); return; }
-  const url = `http://${encodeURIComponent(s.proxy_username)}:${encodeURIComponent(s.proxy_password)}@${s.external_ip}:${eff}`;
-  copyText(url, '节点代理链接已复制');
+  if(!eff) return { reason:'未获取到监听端口，请稍后再试' };
+  return { url:`http://${encodeURIComponent(s.proxy_username)}:${encodeURIComponent(s.proxy_password)}@${s.external_ip}:${eff}` };
+}
+// copyNodeProxy 单节点复制（按需加载 settings）；批量导出见 nodes.js
+async function copyNodeProxy(port){
+  const r = await nodeProxyUrl(port);
+  if(r.reason){ toast(r.reason, 'warn'); return; }
+  copyText(r.url, '节点代理链接已复制');
 }
 
 /* ===== pjax 局部刷新（侧边栏等公共壳不重绘，只换 <main>） ===== */

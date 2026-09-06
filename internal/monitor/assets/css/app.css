@@ -117,6 +117,13 @@
   /* 实际 IP：可点击复制，IPv6 较长时 ellipsis 截断、hover title 看全 */
   .copyable-ip { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:bottom; cursor:pointer; }
   .copyable-ip:hover { color:var(--primary); }
+  /* 节点多选复选框（批量导出）：小尺寸 + 主题色 */
+  .node-check { width:14px; height:14px; margin:0; accent-color:var(--primary); cursor:pointer; vertical-align:middle; }
+  /* 批量操作条（节点多选导出）：选中 >0 时显示 */
+  .batch-bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:10px 14px; margin-bottom:12px;
+    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); font-size:13px; color:var(--text-secondary); }
+  .batch-bar b { color:var(--text-primary); }
+  .batch-over { color:var(--warning); }
   thead th { text-align:left; padding:10px 14px; font-size:11px; font-weight:600;
     color:var(--text-secondary); letter-spacing:0.04em; text-transform:uppercase;
     border-bottom:1px solid var(--border); background:var(--surface-2); white-space:nowrap; }
